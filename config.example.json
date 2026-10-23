@@ -237,6 +237,25 @@
       "idleThresholdMs": 900000,
       "probability": 0.3
     },
+    "burst": {
+      "enabled": true,
+      "windowMs": 180000,
+      "probability": 0.3,
+      "transitionMs": 1800000,
+      "transitionProbability": 0.1
+    },
+    "contextGuard": {
+      "enabled": true,
+      "maxTokens": 50000,
+      "cooldownMs": 600000
+    },
+    "ownerPing": {
+      "enabled": true,
+      "keywords": [],
+      "cooldownMs": 600000,
+      "text": "老大，有人问到「{kw}」的问题，你来看看"
+    },
+    "conversations": {},
     "feedback": {
       "maxLength": 500,
       "notifyOwnerOnError": false

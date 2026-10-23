@@ -10467,7 +10467,12 @@ async function main() {
     const st = getSocialV2State(key);
     // 已有真实唤醒/有限睡眠/回复检查在排队时不再重复安排，避免 AI 被连环唤醒。
     if (st.pendingWakeTimer || st.sleepTimer || st.replyCheckTimer) return;
-    let delay = Math.max(1000, Number(cfg.socialV2?.autoReplyCheckMs) || 30000);
+    // 回复检查可被显式关闭：设 autoReplyCheckMs <= 0 即不再安排。
+    // 它本身是一次**无条件唤醒**（不判断有没有人回话），等于每说一句就多烧一个回合；
+    // 而收消息本来就会经三态窗口唤醒，所以主动聊天场景下往往是纯重复开销。
+    const replyCheckRaw = Number(cfg.socialV2?.autoReplyCheckMs);
+    if (Number.isFinite(replyCheckRaw) && replyCheckRaw <= 0) return;
+    let delay = Math.max(1000, replyCheckRaw || 30000);
     const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
     const recentSelf = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 15000);
     const askedQuestion = recentSelf.some((m) => /[?？吗呢怎么有没有能不能]/.test(String(m.text || m.plain || '')));
