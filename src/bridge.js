@@ -20,8 +20,9 @@ import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } fr
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
-import { compactModelMessage } from './qq-model-view.js';
+import { compactModelMessage, describeAge } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { normalizeImageForModel } from './media-normalize.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -279,9 +280,11 @@ const ROLES_DIR = path.join(ROOT, 'roles');
 const ROLE_NAME_MAX = 40;
 const ROLE_CONTENT_MAX_BYTES = 64 * 1024;
 // 注入上限：**按模式筛完小节之后**再截断，避免另一模式的专属内容白白占掉预算。
-// 默认 6000（沿用历史值，是每条约 4~6k token 的成本护栏），可用 config.json 的
-// role.maxInjectChars 调整（1000~20000）；启动时由 applyRoleInjectLimit() 写入。
-const ROLE_INJECT_MAX_CHARS_DEFAULT = 6000;
+// 默认 8000（2026-10 起：小鲸鱼卡补了形象/圈层/白饭-token/开发事件梗，6000 会把
+// 末尾「你的样子」整段截掉——截断点落在卡尾而不是卡中，比调大预算更危险），
+// 仍是每条约 6~8k token 的成本护栏；可用 config.json 的 role.maxInjectChars 调整
+// （1000~20000）；启动时由 applyRoleInjectLimit() 写入。
+const ROLE_INJECT_MAX_CHARS_DEFAULT = 8000;
 let roleInjectMaxChars = ROLE_INJECT_MAX_CHARS_DEFAULT;
 function applyRoleInjectLimit(value) {
   const n = Number(value);
@@ -1433,6 +1436,34 @@ async function main() {
   }
 
   // 从 SnowLuma OneBot 拉取 QQ 账号收藏表情（fetch_custom_face_detail），并合并进本地库。
+  // ── 读接口的 HTTP 兜底：WS 挂了不等于网关挂了 ──────────────────────────────
+  //
+  // 为什么要有：`fetch_custom_face_detail` 原来只走 SnowLuma 的 WS action，于是
+  // 「WS 正在重连」这段时间里表情库同步必然失败。日志实测 33 次同步里 16 次失败（≈48%），
+  // 全是 `SnowLuma WebSocket closed before opening`；表现就是操作者说的
+  // 「有时读群友的表情包会失败」——库里没有新收藏 ⇒ qq_get_sticker_image 直接报「找不到表情」。
+  //
+  // 而**同一个网关的 HTTP 口一直是可用的**（onebotSend 发消息、fetch_ptt_text 转写都直接用它）。
+  // 读接口没有理由单点依赖 WS。这里只在 WS 失败时兜底，不改变正常路径的延迟。
+  async function onebotHttpAction(action, params = {}, { timeoutMs = 15000 } = {}) {
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    const res = await fetch(`${httpUrl}/${action}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+      },
+      body: JSON.stringify(params ?? {}),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+      const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口）' : '';
+      throw new Error(`OneBot HTTP ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
+    }
+    return body;
+  }
+
   // force=true 时忽略 TTL 强制刷新；失败时返回 null（调用方决定是否使用缓存）。
   async function syncStickerLibrary(force = false) {
     if (cfg.socialV2?.sticker?.enabled === false) return null;
@@ -1444,9 +1475,18 @@ async function main() {
     }
     try {
       const count = Math.min(500, Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100));
-      const response = await bot.request('fetch_custom_face_detail', { count });
-      if (!response || response.status !== 'ok' || response.retcode !== 0) {
-        throw new Error(`fetch_custom_face_detail 失败: ${response?.wording || response?.retcode || 'unknown'}`);
+      let response;
+      let via = 'ws';
+      try {
+        response = await bot.request('fetch_custom_face_detail', { count });
+        if (!response || response.status !== 'ok' || response.retcode !== 0) {
+          throw new Error(`fetch_custom_face_detail 失败: ${response?.wording || response?.retcode || 'unknown'}`);
+        }
+      } catch (wsError) {
+        // WS 失败 ⇒ 立刻用 HTTP 再问一次同一个 action（语义相同，token 可能不同但同一账号）。
+        log(`[sticker] WS 同步不可用（${wsError?.message ?? wsError}），改走 OneBot HTTP 兜底`);
+        response = await onebotHttpAction('fetch_custom_face_detail', { count });
+        via = 'http';
       }
       // 只有拿到合法数组才允许合并；data 缺失/异常时不能拿空数组清空本地 QQ 表情库。
       if (!Array.isArray(response.data)) {
@@ -1456,8 +1496,8 @@ async function main() {
       stickerEntries = mergeStickerLibrary(stickerEntries, fetched, { complete: fetched.length < count });
       stickerSyncedAt = Date.now();
       saveStickerStoreSafe();
-      log(`[sticker] 已同步 QQ 收藏表情 ${fetched.length} 个（本地库 ${stickerEntries.length} 条）`);
-      return { entries: stickerEntries, syncedAt: stickerSyncedAt, fromCache: false };
+      log(`[sticker] 已同步 QQ 收藏表情 ${fetched.length} 个（本地库 ${stickerEntries.length} 条，via ${via}）`);
+      return { entries: stickerEntries, syncedAt: stickerSyncedAt, fromCache: false, via };
     } catch (error) {
       log(`[sticker] 同步收藏表情失败: ${error?.message ?? error}`);
       return null;
@@ -3114,9 +3154,14 @@ async function main() {
      * 无法发到群里。但真实用法是"老大在私聊说：去某个群说句什么"。
      * 这里只放开一条窄路：**只有 ownerQQ 的私聊令牌**、且目标是**白名单里的群**。
      * 非管理员的私聊、以及私聊之外的任何目标，仍然走原来的严格绑定。
+     *
+     * 这是一条**默认关闭**的能力（`socialV2.ownerDelegate.enabled === true` 才开）：
+     * 开了以后，owner 私聊的令牌就等于"白名单内所有群的写权限"，属于攻击面扩大，
+     * 应该由操作者显式选择，而不是默认生效。
      */
     const agentTokenOkOrOwnerDelegate = (key, token) => {
       if (agentTokenOk(key, token)) return true;
+      if (cfg.socialV2?.ownerDelegate?.enabled !== true) return false;
       const k = String(key ?? '');
       if (!k.startsWith('group:')) return false;
       const owner = String(cfg.ownerQQ ?? '').trim();
@@ -5608,6 +5653,11 @@ async function main() {
               return;
             }
             const mimeType = mimeFromBuffer(fetched.buffer) || mimeFromUrl(entry.url);
+            const prep = await toModelMedia(fetched.buffer, mimeType, `收藏表情 ${entry.id}`);
+            if (!prep.ok) {
+              sendJson({ ok: false, error: `表情图片无法提供给模型：${prep.error}` }, 413);
+              return;
+            }
             sendJson({
               ok: true,
               key,
@@ -5619,7 +5669,8 @@ async function main() {
                 url: entry.url,
                 md5: entry.md5
               },
-              image: { mimeType, data: fetched.buffer.toString('base64') }
+              image: { mimeType: prep.mimeType, data: prep.buffer.toString('base64') },
+              ...(prep.note ? { note: prep.note } : {})
             });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情图片失败：${error?.message ?? error}` }, 500);
@@ -6270,9 +6321,15 @@ async function main() {
             return;
           }
           const preSleepWaitMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-          const preSleepRemainingMs = preSleepWaitBlockedV2(st)
+          // 闸门状态只算一次：既用于 preSleepWaitRemainingMs，也用于下面直接告诉模型"现在能不能收尾"。
+          const preSleepBlocked = preSleepWaitBlockedV2(st);
+          const preSleepRemainingMs = preSleepBlocked
             ? Math.max(0, preSleepWaitMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0))
             : 0;
+          // 这次等待「算不算沉睡前观察」：闸门只认单次 timeoutMs ≥ 观察窗口的调用。
+          // 实测踩过：模型用 timeoutMs=90000 等了 90 秒，以为完成了观察，结果闸门不认，
+          // 只能再补一次 180 秒 —— 白花一轮。所以要在返回里把这件事说破，而不是让它自己悟。
+          const preSleepCountsAsObservation = !replyWait && timeoutMs >= preSleepWaitMs;
           const quiet = (replyWait || (arrived && quietMs > 0)) && (Date.now() - lastNewAt >= quietMs);
           // 判断这次等待是否是“沉睡前观察尝试”：AI 明确请求等满观察窗口（默认 5 分钟）。
           // 只有这种尝试里等到新消息，才会把“已观察并看到新消息”标记下来，允许 AI 看过新消息后直接决定不参与并沉睡。
@@ -6307,9 +6364,28 @@ async function main() {
             ? [...(v2ToolEnabled('getUnread') ? st.unread : []),
               ...(v2ToolEnabled('getRecent') ? st.recentMessages : [])]
             : (Array.isArray(st.recentMessages) ? st.recentMessages : []);
-          const pending = [...new Map(history
-            .filter((m) => m && !m.isSelf && (m.seq || 0) > baseline)
+          // ── 漏消息窗口（2026-10-18 修）──────────────────────────────────
+          //
+          // 旧实现按 `seq > baseline` 取"本次等待期间新到的"，而 baseline 对普通等待是
+          // **请求开始时的 lastUnreadSeq**。于是「模型思考/发消息那几秒里到达的消息」
+          // 永远落在窗口外：本次不返回、下次请求的 baseline 已经越过它们 ⇒ 既没展示给模型，
+          // 也没进 readThroughSeq（连续游标）⇒ 水位从此卡死。
+          // 实测：会话末段 readThroughSeq 钉在 185，可模型已经看过 205，
+          // 之后每次等待都要多读一次 unread 才能收尾；期间有人 @ 也完全没进本回合。
+          //
+          // 现在按**已读过水位**取：凡是没有进入 readThroughSeq 的消息，一律补给它。
+          // `arrived` 仍按 requestSeq 判（"有没有新动静"语义不变），所以等待不会变成忙轮询；
+          // 只要这次确实返回了，返回的就是「从水位起连续的一段」，模型据此能正常推进水位。
+          const watermarkAtRequest = readThroughSeqV2(st);
+          const pendingFloor = Math.min(baseline, watermarkAtRequest);
+          const fullPending = [...new Map(history
+            .filter((m) => m && !m.isSelf && (m.seq || 0) > pendingFloor)
             .map((m) => [m.seq, m])).values()].sort((a, b) => a.seq - b.seq);
+          // 有上限：一次倒 30 条旧账会把上下文挤爆。**必须从最老的开始取**（连续，
+          // 水位才推得动）；被截断时 partial=true，提示模型用 unread 工具续读。
+          const waitCap = Math.min(50, Math.max(12, Number(cfg.socialV2?.context?.unreadLimit) || 30));
+          const pending = fullPending.length > waitCap ? fullPending.slice(0, waitCap) : fullPending;
+          const pendingTruncated = fullPending.length > pending.length;
           // `arrived` is recomputed against what this request may actually hand over,
           // so a suppressed buffer cannot report an arrival it is not allowed to show.
           const newMessages = replyWait ? pending : (arrived ? pending : []);
@@ -6332,9 +6408,25 @@ async function main() {
             waitedMs,
             preSleepWaitSatisfied: preSleepSatisfiedNow,
             preSleepWaitObserved: !replyWait && !!st.preSleepWaitObservedAt,
+            // 补发被上限截断时告诉模型「还有更老的没给」，它才知道要用 unread(afterSeq=readThroughSeq) 续读。
+            ...(pendingTruncated ? { partial: true } : {}),
             // A reply check has no sleep countdown; showing one here suggests
             // the model should complete sleep observation before its first reply.
             ...(!replyWait ? { preSleepWaitMs, preSleepWaitRemainingMs: preSleepRemainingMs } : {}),
+            // ── 直接说「现在能不能收尾、该怎么收」 ────────────────────────────
+            //
+            // 为什么不能只给 preSleepWaitRemainingMs 让模型自己解读：实测它会用一次
+            // timeoutMs=90000 的等待去凑 180 秒的观察窗口（闸门根本不认），然后再补一次 180 秒，
+            // 白花一轮。这里把闸门的判断结果和**该发的参数**直接写给它，
+            // 并且**只在闸门真的放行时**才说「可以收尾」——绝不诱导它提前设置潜水
+            // （那会被桥接 400 拒绝，反而更慢）。
+            ...(!replyWait ? {
+              canSleepNow: !preSleepBlocked,
+              countsAsObservation: preSleepCountsAsObservation,
+              hint: preSleepBlocked
+                ? `还不能收尾：还需约 ${Math.ceil(preSleepRemainingMs / 1000)} 秒没有新消息。要完成沉睡前观察，请用 qq_wait_for_messages(timeoutMs=${preSleepWaitMs}) 一次等满——更短的 timeoutMs 不算观察，满足不了闸门（本次 ${Math.round(timeoutMs)}ms ${preSleepCountsAsObservation ? '达标' : '不达标'}）。`
+                : '现在可以直接收尾：qq_mark_read(throughSeq=已读水位) 或 qq_set_wake_config(throughSeq=已读水位, config=…)。不用再等一轮。'
+            } : {}),
             newMessages,
             readThroughSeq,
             unreadCount: st.unread.length
@@ -6667,6 +6759,55 @@ async function main() {
           }
           const members = [...map.values()].sort((a, b) => b.count - a.count || b.lastTime - a.lastTime).slice(0, limit);
           sendJson({ ok: true, key, members });
+          return;
+        }
+        // ── 群成员列表（v2 读工具；替代只有 closed-agent 才能用的旧只读工具）────────
+        //
+        // 为什么需要这一条：qq-chat-v2 预设第 6 条明确要求「QQ 号从 qq_get_group_members 的
+        // user_id 拿」，但旧版是无令牌工具、在 reserved2 下必然 403 —— 模型被自己的提示词
+        // 引到一个永远失败的工具上（实测 turn10 白烧一步）。这里给它一个带会话令牌的 v2 形态。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/group-members') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          const groupMatch = /^group:(\d+)$/.exec(key);
+          if (!groupMatch) { sendJson({ ok: false, error: '群成员只能按 group:群号 查询' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          // ⚠️ 白名单/模式判定**不能**挂在「有令牌」条件里：closed-agent 的代理调用本来就不带令牌
+          // （它走的是操作者路径），只按 header 判断会让它拿任意群号去枚举成员 ——
+          // 那正是旧 qq_get_group_members 明确防住的事（先 legacyReadToolAllowed 再 isAllowed）。
+          //
+          // 也不能直接用 v2SessionAllowed：它的 closed-agent 分支只放行 `private:<ownerQQ>`，
+          // 于是「管理员在私聊里让 AI 看看某群成员」会 403 —— 那是旧工具本来支持的能力，
+          // 属于这次改动不该带走的回归。所以 closed-agent 下按**同样严格的白名单**放行群读取。
+          const groupMembersAllowed = currentMode === 'closed-agent'
+            ? allowed('group', Number(groupMatch[1]), cfg)
+            : v2SessionAllowed(key);
+          if (!groupMembersAllowed) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getGroupMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_group_members' }, 403); return; }
+          const groupId = Number(groupMatch[1]);
+          try {
+            let response;
+            try {
+              response = await bot.request('get_group_member_list', { group_id: groupId });
+            } catch (wsError) {
+              // 与表情库同步同一条原则：WS 挂了不代表网关挂了，读接口走 HTTP 兜底。
+              response = await onebotHttpAction('get_group_member_list', { group_id: groupId });
+            }
+            const payload = response && typeof response === 'object' && response.data !== undefined ? response.data : response;
+            const raw = Array.isArray(payload) ? payload : (Array.isArray(payload?.data) ? payload.data : null);
+            if (!raw) { sendJson({ ok: false, error: '网关返回的成员列表格式异常，已拒绝' }, 502); return; }
+            const members = raw.slice(0, limit).map((m) => ({
+              userId: m?.user_id != null ? String(m.user_id) : '',
+              nickname: truncateText(String(m?.nickname ?? ''), 40),
+              card: truncateText(String(m?.card ?? ''), 40),
+              ...(m?.role ? { role: String(m.role) } : {})
+            })).filter((m) => m.userId);
+            sendJson({ ok: true, key, count: raw.length, returned: members.length, truncated: raw.length > members.length, members });
+          } catch (error) {
+            log(`群成员查询失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `获取群成员失败：${error?.message ?? error}` }, 500);
+          }
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-append') {
@@ -7633,6 +7774,49 @@ async function main() {
   })(); // 单张图片像素上限，防止“图片炸弹”解码拖垮 DSH
   const MAX_MEDIA_STORE_PER_KEY = 500; // 每个会话最多缓存多少条消息的媒体元数据，防止无限增长
 
+  // ── 喂给模型的那一份：体积与动图形态归一化 ────────────────────────────────
+  //
+  // 为什么必须在这里动手（而不是"让 DSH 自己处理"）：
+  //   ① DSH 的 MCP 图片入口用正则校验 base64，实测量级 ≥4,474,880 字符（原始字节 ≥3.20 MiB）
+  //      必抛 RangeError: Maximum call stack size exceeded，工具结果被降级成
+  //      `[image unavailable: image/gif; Maximum call stack size exceeded; …]` —— 模型只看到一行错误。
+  //      而下面的 MAX_MEDIA_BYTES 是**抓取**上限（默认 8 MiB），故意留着不动：
+  //      得先把大图抓下来，才有机会压小它。
+  //   ② DSH 对 image/gif 一律归一化成单帧，模型永远只看第一帧，且不知道那是动图。
+  //      动图在桥接侧抽帧拼图后，信息量反而更高（实测 4.83MB/200 帧 → 92KB/269ms）。
+  //
+  // 上限默认值见 media-normalize.js 的 MEDIA_DEFAULTS；config.json 的 socialV2.media 可覆盖。
+  // ⚠️ 只用于**喂模型**的出口。collectStickerV2 走 fetchOneBotImage 的原始字节，不能经过这里，
+  //    否则收藏下来的表情会变成拼图/降采样版本。
+  const modelMediaLimits = (() => {
+    const m = cfg.socialV2?.media ?? {};
+    return {
+      enabled: m.normalize !== false,
+      maxModelBytes: m.maxModelBytes,
+      maxLongEdge: m.maxLongEdge,
+      gifFrames: m.gifFrames,
+      gifTile: m.gifTile,
+      timeoutMs: m.normalizeTimeoutMs,
+      ffmpegPath: process.env.FFMPEG_PATH || cfg.socialV2?.voice?.ffmpegPath || null
+    };
+  })();
+
+  /**
+   * 把一张已抓到的图片整理成模型可安全消费的形态。
+   * @returns {Promise<{ok:boolean, buffer?:Buffer, mimeType?:string, note?:string, error?:string}>}
+   *          ok=false 表示"压不到可用体积"——调用方必须把它变成一句可读的失败原因，
+   *          绝不发注定被 DSH 丢掉的字节（那样模型只会看到看不懂的英文错误）。
+   */
+  async function toModelMedia(buffer, mimeType, label = '图片') {
+    const out = await normalizeImageForModel(buffer, mimeType, { ...modelMediaLimits, label });
+    if (!out.ok) {
+      log(`[media] ${label} 不提供：${out.error}`);
+      return out;
+    }
+    if (out.note) log(`[media] ${label}: ${out.note}`);
+    return out;
+  }
+
   function isSafeLocalMediaPath(filePath) {
     try {
       const real = fs.realpathSync(String(filePath));
@@ -7808,14 +7992,19 @@ async function main() {
       if (!media || typeof media !== 'object') continue;
       if (media.kind === 'face') {
         const face = await fetchFaceMedia(media);
-        if (face.buffer) {
-          if (totalBytes + face.buffer.length > MAX_MEDIA_BYTES) {
+        const prep = face.buffer ? await toModelMedia(face.buffer, face.mimeType, `表情#${media.faceId ?? index}`) : null;
+        if (prep?.ok) {
+          if (totalBytes + prep.buffer.length > MAX_MEDIA_BYTES) {
             parts.push({ type: 'text', text: `[表情${index}（图片总大小超限，已跳过）]` });
             continue;
           }
-          totalBytes += face.buffer.length;
+          totalBytes += prep.buffer.length;
           if (face.text) parts.push({ type: 'text', text: face.text });
-          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}` });
+          if (prep.note) parts.push({ type: 'text', text: `（${prep.note}）` });
+          parts.push({ type: 'image', mediaType: prep.mimeType, data: prep.buffer.toString('base64'), name: `face-${media.faceId}.${(prep.mimeType || 'png').split('/')[1]}` });
+        } else if (prep && !prep.ok) {
+          // 压不到可用体积：明确说明原因，别让模型对着「（获取失败）」瞎猜。
+          parts.push({ type: 'text', text: `[表情${index}（${prep.error}）]` });
         } else {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
         }
@@ -7824,14 +8013,18 @@ async function main() {
         const sticker = media.kind === 'sticker';
         const summary = sticker && media.summary ? `:${String(media.summary).slice(0, 20)}` : '';
         const label = sticker ? (summary ? `[表情${summary}]` : `[表情${index}]`) : `[图片${index}]`;
-        if (img?.buffer) {
-          if (totalBytes + img.buffer.length > MAX_MEDIA_BYTES) {
+        const prep = img?.buffer ? await toModelMedia(img.buffer, img.mimeType, `${label}`) : null;
+        if (prep?.ok) {
+          if (totalBytes + prep.buffer.length > MAX_MEDIA_BYTES) {
             parts.push({ type: 'text', text: `${label}（图片总大小超限，已跳过）` });
             continue;
           }
-          totalBytes += img.buffer.length;
+          totalBytes += prep.buffer.length;
           parts.push({ type: 'text', text: label });
-          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}` });
+          if (prep.note) parts.push({ type: 'text', text: `（${prep.note}）` });
+          parts.push({ type: 'image', mediaType: prep.mimeType, data: prep.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(prep.mimeType || 'image/jpeg').split('/')[1]}` });
+        } else if (prep && !prep.ok) {
+          parts.push({ type: 'text', text: `${label}（${prep.error}）` });
         } else {
           parts.push({ type: 'text', text: `${label}（获取失败）` });
         }
@@ -7853,20 +8046,23 @@ async function main() {
       if (!media || typeof media !== 'object') continue;
       if (media.kind === 'face') {
         const face = await fetchFaceMedia(media);
-        if (face.buffer) {
-          if (totalBytes + face.buffer.length > MAX_MEDIA_BYTES) {
+        const prep = face.buffer ? await toModelMedia(face.buffer, face.mimeType, `表情#${media.faceId ?? index}`) : null;
+        if (prep?.ok) {
+          if (totalBytes + prep.buffer.length > MAX_MEDIA_BYTES) {
             out.push({ index, kind: 'face', faceId: media.faceId ? String(media.faceId) : undefined, text: '（图片总大小超限，已跳过）' });
             continue;
           }
-          totalBytes += face.buffer.length;
+          totalBytes += prep.buffer.length;
           out.push({
             index,
             kind: 'face',
             faceId: media.faceId ? String(media.faceId) : undefined,
-            mimeType: face.mimeType || 'image/png',
-            data: face.buffer.toString('base64'),
-            text: face.text || ''
+            mimeType: prep.mimeType,
+            data: prep.buffer.toString('base64'),
+            text: [face.text || '', prep.note ? `（${prep.note}）` : ''].filter(Boolean).join(' ')
           });
+        } else if (prep && !prep.ok) {
+          out.push({ index, kind: 'face', faceId: media.faceId ? String(media.faceId) : undefined, text: `（获取失败：${prep.error}）` });
         } else {
           out.push({ index, kind: 'face', faceId: media.faceId ? String(media.faceId) : undefined, text: face.text || `[表情#${media.faceId}]` });
         }
@@ -7883,18 +8079,21 @@ async function main() {
           ...(media.summary ? { summary: String(media.summary) } : {}),
           ...(media.subType ? { subType: String(media.subType) } : {})
         };
-        if (img?.buffer) {
-          if (totalBytes + img.buffer.length > MAX_MEDIA_BYTES) {
+        const prep = img?.buffer ? await toModelMedia(img.buffer, img.mimeType, `${noun}${index}`) : null;
+        if (prep?.ok) {
+          if (totalBytes + prep.buffer.length > MAX_MEDIA_BYTES) {
             out.push({ ...base, text: `（${noun}总大小超限，已跳过）` });
             continue;
           }
-          totalBytes += img.buffer.length;
+          totalBytes += prep.buffer.length;
           out.push({
             ...base,
-            mimeType: img.mimeType || 'image/jpeg',
-            data: img.buffer.toString('base64'),
-            text: ''
+            mimeType: prep.mimeType,
+            data: prep.buffer.toString('base64'),
+            text: prep.note ? `（${prep.note}）` : ''
           });
+        } else if (prep && !prep.ok) {
+          out.push({ ...base, text: `（${noun}获取失败：${prep.error}）` });
         } else {
           out.push({ ...base, text: `（${noun}获取失败）` });
         }
@@ -8487,6 +8686,11 @@ async function main() {
             replyCheckTimer: null,
             proactiveTimer: null,
             lastIncomingAt: Number(val.lastIncomingAt) || 0,
+            // 三态窗口与「最近一条是否管理员」也要跨重启保留：否则重启后模型明明在聊，
+            // 却被当成静默态；高峰的 owner 例外同理。
+            burstUntil: Number(val.burstUntil) || 0,
+            transitionUntil: Number(val.transitionUntil) || 0,
+            lastInboundIsOwner: val.lastInboundIsOwner === true,
             preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
             preSleepWaitAccumMs: Number(val.preSleepWaitAccumMs) || 0,
@@ -8576,6 +8780,9 @@ async function main() {
           sendTimes: st.sendTimes.slice(-500),
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
           lastIncomingAt: st.lastIncomingAt || 0,
+          burstUntil: st.burstUntil || 0,
+          transitionUntil: st.transitionUntil || 0,
+          lastInboundIsOwner: st.lastInboundIsOwner === true,
           preSleepWaitSatisfiedAt: st.preSleepWaitSatisfiedAt || 0,
           preSleepWaitObservedAt: st.preSleepWaitObservedAt || 0,
           preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
@@ -9784,6 +9991,12 @@ async function main() {
     const st = getSocialV2State(key);
     // 记录最近一条消息是不是管理员发的：高峰时段策略要用它判断能不能破例。
     st.lastInboundIsOwner = isOwner === true;
+    // 对方明确收尾（"晚安/下了/拜拜/去忙了"）时立刻关掉活跃期/过渡期：
+    // 否则模型已经道别，桥接还会按 10%~30% 的概率把它叫回来接话。
+    if (EXPLICIT_END_RE.test(String(plainContent ?? ''))) {
+      st.burstUntil = 0;
+      st.transitionUntil = 0;
+    }
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
     // 存储层的归一化**不能只留 kind/file/url/faceId**：reserved2 的图片/表情工具
@@ -10113,36 +10326,13 @@ async function main() {
     return p > 0 && Math.random() < p;
   }
 
-  /** 发任意 OneBot 消息段（用于 @ 管理员这类需要 at 段的场景）。 */
-  async function onebotSendSegments(key, segments) {
-    const [kind, rawId] = String(key).split(':');
-    const id = Number(rawId);
-    if (!Number.isFinite(id) || id <= 0) throw new Error(`消息段发送：key 无效 ${key}`);
-    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
-    const params = kind === 'private' ? { user_id: id, message: segments } : { group_id: id, message: segments };
-    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-    const res = await fetch(`${httpUrl}/${action}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-      },
-      body: JSON.stringify(params),
-      signal: AbortSignal.timeout(15000)
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
-      throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}`);
-    }
-    return body.data;
-  }
-
   /**
-   * 管理员关注词：群里有人问到指定内容时，直接 @ 管理员，不需要模型参与。
+   * 关注词 @ 管理员：群里有人问到指定内容时，直接 @ 管理员，不需要模型参与。
    *
    * 为什么放在桥接而不是提示词里：这是纯字符串匹配，交给模型判断既要多一步推理、
    * 又可能漏（模型可能觉得"这不是在问我"）。放在这里则确定性 100%、零 token。
-   * 命中后同时开启活跃期/过渡期，让随后的讨论自然接上。
+   * 发送走 sendMessagesV2（和模型发言同一条管线）：同样的限频、令牌审计、串行队列，
+   * 并把这条 @ 记进 recentMessages——否则模型下一轮不知道自己刚 ping 过谁。
    */
   const ownerPingCooldown = new Map();
   /**
@@ -10194,28 +10384,58 @@ async function main() {
     const hit = kws.find((k) => text.includes(k));
     if (!hit) return false;
     // 只有问句/质疑才叫管理员；纯陈述（"我今天在练压制境界"）不打扰。
+    let why = 'quality-not-required';
     if (p.requireQuestion !== false) {
       const quality = ownerPingQualityV2(text, hit, p);
       if (!quality.ok) {
         log(`[reserved2] 关注词「${hit}」出现在陈述句里，跳过 @（${quality.why}）`);
         return false;
       }
+      why = quality.why;
     }
     const owner = String(cfg.ownerQQ ?? '').trim();
     if (!owner) return false;
+    const now = Date.now();
     const cooldown = Math.max(0, Number(p.cooldownMs) || 10 * 60 * 1000);
     const last = ownerPingCooldown.get(key) || 0;
-    if (Date.now() - last < cooldown) return false;
-    ownerPingCooldown.set(key, Date.now());
-    armActiveV2(key, st);
-    bumpTransitionV2(key, st);
+    if (now - last < cooldown) return false;
     const tmpl = String(p.text || '老大，有人问到「{kw}」的问题，你来看看');
     const content = tmpl.replace(/\{kw\}/g, hit);
-    await onebotSendSegments(key, [
-      { type: 'at', data: { qq: owner } },
-      { type: 'text', data: { text: ' ' + content } }
-    ]);
-    log(`[reserved2] 关注词「${hit}」命中（${ownerPingQualityV2(text, hit, p).why}）：已 @ 管理员 ${owner}，并开启活跃期`);
+    if (SENSITIVE_RE.test(content)) {
+      log(`[reserved2] 关注词「${hit}」的提示文案含敏感信息，跳过 @`);
+      return false;
+    }
+    // 和模型发言共用一份发送额度：不要因为"这是桥接自己发的"就绕过限频。
+    const sendCfg = socialV2For(key)?.send ?? {};
+    const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
+    const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
+    const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
+    const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
+    if ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour)) {
+      log(`[reserved2] 关注词「${hit}」命中，但发送限频已满，跳过 @`);
+      return false;
+    }
+    ownerPingCooldown.set(key, now);
+    st.sendTimes = [...(st.sendTimes || []), now].slice(-500);
+    let sent;
+    try {
+      sent = await sendMessagesV2(key, [content], [0], null, owner);
+    } catch (error) {
+      log(`[reserved2] 关注词「${hit}」@ 管理员失败：${error?.message ?? error}`);
+      return false;
+    }
+    armActiveV2(key, st);
+    bumpTransitionV2(key, st);
+    if (Array.isArray(sent) && sent.length) {
+      recordSentMessagesV2(key, [`@${owner} ${content}`]);
+    } else {
+      saveSocialV2State();
+    }
+    st.lastAiReplyAt = now;
+    st.lastActionAt = now;
+    st.wakeConfig.noActionCount = 0;
+    saveSocialV2State();
+    log(`[reserved2] 关注词「${hit}」命中（${why}）：已 @ 管理员 ${owner}，并开启活跃期`);
     appendActivity(`${key} [关注词] 命中「${hit}」，已 @ 管理员`);
     return true;
   }
@@ -10331,6 +10551,87 @@ async function main() {
     return before - st.unread.length;
   }
 
+  // ── 时间观念（沉睡后醒来最容易犯的错） ────────────────────────────────────
+  //
+  // 现象（操作者报告 + 会话实证）：AI 沉睡很久后被唤醒，看到一小时前的话仍然当成"刚发的"去接，
+  // 甚至抢进早已散场的话题。根因有两层：
+  //   ① 模型看到的时间是裸 epoch（`time: 1792294529471`），它根本算不出"这是 38 分钟前"
+  //      → 已由 qq-model-view.js 换成 `at`/`ago`；
+  //   ② 提示词里**没有任何一条规则**告诉它"旧消息不该按实时对话接"。
+  // 这里补第二层：把「现在 / 最新一条多旧 / 唤醒原因那条多旧」算好直接写进去，并给分档规则。
+  // 阈值可调（config.json 的 socialV2.wake.staleChatMinutes / staleSilentMinutes）。
+  const pad2 = (n) => (n < 10 ? `0${n}` : String(n));
+
+  /** 本地 HH:MM（与消息 at 字段同一口径）。 */
+  function localClockText(ms) {
+    const d = new Date(Number(ms));
+    if (!Number.isFinite(d.getTime())) return '';
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  }
+
+  function timeSenseCfg() {
+    const wake = cfg.socialV2?.wake ?? {};
+    const boundedMin = (value, fallback, min, max) => {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= min ? Math.min(max, Math.round(n)) : fallback;
+    };
+    const chatMin = boundedMin(wake.staleChatMinutes, 10, 1, 600);
+    // 「默认不回」必须不早于「不算实时对话」，否则两档规则会互相打架。
+    const silentMin = Math.max(chatMin, boundedMin(wake.staleSilentMinutes, 120, 5, 2880));
+    return { chatMin, silentMin };
+  }
+
+  /** 唤醒原因里带的本地 seq（形如 `atMention@seq194`），没有就 null。 */
+  function wakeReasonSeq(reason) {
+    const match = /@seq(\d+)$/.exec(String(reason ?? '').trim());
+    if (!match) return null;
+    const seq = Number(match[1]);
+    return Number.isSafeInteger(seq) && seq > 0 ? seq : null;
+  }
+
+  function findV2MessageBySeq(st, seq) {
+    if (!st || !Number.isSafeInteger(seq)) return null;
+    for (const list of [st.unread, st.recentMessages]) {
+      const hit = (Array.isArray(list) ? list : []).find((m) => m && m.seq === seq);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  /**
+   * 【时间感】规则块。没有可判断的消息时返回空串（引导/定时唤醒不必背这段）。
+   *
+   * 注意阈值必须和 §timeSenseCfg 一致，否则模型会看到自相矛盾的两档。
+   */
+  function buildTimeSenseLine(st) {
+    const now = Date.now();
+    const newest = [...(Array.isArray(st.unread) ? st.unread : [])].reverse().find((m) => m && !m.isSelf)
+      || [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf)
+      || null;
+    if (!newest) return '';
+    const ageText = describeAge(newest.time, now);
+    if (!ageText) return '';
+    const { chatMin, silentMin } = timeSenseCfg();
+    const sender = String(newest.sender || '未知');
+    const ageMin = Math.max(0, Math.floor((now - Number(newest.time)) / 60000));
+    const staleNow = ageMin >= chatMin;
+    const tooOld = ageMin >= silentMin;
+    const lines = [
+      `【时间感：先看消息多旧，再决定怎么开口】现在 ${localClockText(now)}；最新一条来自「${sender}」，是 ${ageText} 之前发的（${localClockText(newest.time)}）。`,
+      '- 消息里的 at 是本地时间、ago 是距现在多久；开口前先确认最新那条的 ago，不要凭感觉当成"刚刚"。',
+      `- ${chatMin} 分钟以内：正常接，当实时对话。`
+    ];
+    // 中间档只在两档阈值真的分开时才写：silentMin === chatMin 时写「60～60 分钟」是自相矛盾的废话。
+    if (silentMin > chatMin) {
+      lines.push(`- ${chatMin}～${silentMin} 分钟：可以接，但别用"刚""哈哈哈刚看到"这类实时语气；先确认这个话题还在不在、对方还在不在。`);
+    }
+    lines.push(`- 超过 ${silentMin} 分钟：默认不回，直接 qq_mark_read 收尾；只有当那条明确是找你/提问你、而且回答现在仍然有用时才回，并且开头要带时间感（"这条我才看到""过了挺久才看到"）。`);
+    if (staleNow) {
+      lines.push(`⚠️ 本次属于「旧账」：最新消息已经是 ${ageText} 前，${tooOld ? `超过 ${silentMin} 分钟` : `超过 ${chatMin} 分钟`}。不要用秒回语气，也不要把别人的旧话题当现在的事接。`);
+    }
+    return `${lines.join('\n')}\n\n`;
+  }
+
   function buildWakeSnapshotV2(key) {
     const context = cfg.socialV2?.context ?? {};
     if (context.inlineWakeMessages === false || (!v2ToolEnabled('getUnread') && !v2ToolEnabled('getRecent'))) return null;
@@ -10342,10 +10643,25 @@ async function main() {
     const maxChars = bounded('wakeMaxChars', 6000, 500, 20000);
     const maxUnread = bounded('wakeMessageLimit', 12, 1, 100);
     const maxRecent = bounded('wakeRecentLimit', 4, 0, 20);
-    const packet = { messages: [], recent: [], unreadCount: st.unread.length, includedUnreadCount: 0, readThroughSeq: readThroughSeqV2(st), partial: st.unread.length > 0 };
+    // 一次快照只取一次 now：同一批消息的 ago 必须彼此可比。
+    const now = Date.now();
+    const newestIncoming = [...(Array.isArray(st.unread) ? st.unread : [])].reverse()
+      .find((m) => m && !m.isSelf) || null;
+    const newestAgo = newestIncoming ? describeAge(newestIncoming.time, now) : '';
+    const packet = {
+      messages: [],
+      recent: [],
+      // now / newestAgo 让模型不必自己换算：最新一条多旧，直接写在快照头上。
+      now: localClockText(now),
+      ...(newestAgo ? { newestAgo } : {}),
+      unreadCount: st.unread.length,
+      includedUnreadCount: 0,
+      readThroughSeq: readThroughSeqV2(st),
+      partial: st.unread.length > 0
+    };
     const tryAdd = (field, msg) => {
       const previousThrough = packet.readThroughSeq;
-      packet[field].push(compactModelMessage(msg));
+      packet[field].push(compactModelMessage(msg, { now }));
       packet.includedUnreadCount = packet.messages.length;
       packet.readThroughSeq = readThroughSeqV2(st, [...packet.messages, ...packet.recent]);
       packet.partial = packet.messages.length < st.unread.length;
@@ -10413,14 +10729,26 @@ async function main() {
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
+    // 收尾策略：`wake.preSleepWaitEnabled` 是本仓库的开关（桥接的 mark_read/set_wake_config 闸门也认它）。
+    // 关掉时提示词必须同步改口，否则模型会去执行一个已经不需要、而且很贵的 5 分钟等待。
+    const preSleepGate = cfg.socialV2?.wake?.preSleepWaitEnabled !== false;
+    // 等待工具没启用时不要再叫它——否则模型每轮都去调一个不存在的工具。
+    const waitToolOn = cfg.socialV2?.tools?.waitMessages !== false;
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
     const replyTiming = replyTimingV2(st);
-    const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
-    const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。如果返回里带 preSleepWaitRemainingMs，就按剩余时间继续等待。\n\n`;
+    const replyLine = waitToolOn
+      ? `【首回复节奏】先处理已有消息，完整的问题及时回答。只有拿不准对方是否还要补充时，才用一次 qq_wait_for_messages(purpose="reply", quietMs=${Math.min(3000, replyTiming.quietMs)}) 短看一遍（已安静够久会立即返回，期间的新消息一起带回，最多 8 秒）；目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。别为一句话反复重开等待，更不要用它守候长回复。\n\n`
+      : '';
+    const preSleepLine = preSleepGate
+      ? `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。【不要靠猜】：等待返回里的 canSleepNow/hint 就是闸门的判断结果——canSleepNow=true 立刻收尾（mark_read 或 set_wake_config）；false 时按 hint 给出的 timeoutMs 一次等满，别用更短的 timeoutMs 去凑（更短的等待不算观察，只会白等一轮）。\n\n`
+      : '【收尾】想潜水就直接 qq_mark_read(throughSeq=读到的水位) 或 qq_set_wake_config(config=新配置, throughSeq=读到的水位)，不要用 qq_wait_for_messages 守着等：桥接会在有新消息、被 @、被叫到时自己唤醒你。\n\n';
     const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
     const lastAiMin = st.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(st.lastAiReplyAt)) / 60000)) : null;
     const statusBits = [`未读 ${(st.unread || []).length} 条`];
-    if (lastMsg) statusBits.push(`最近一条来自 ${String(lastMsg.sender || '未知')}：${String(lastMsg.text || lastMsg.plain || '').slice(0, 30)}`);
+    if (lastMsg) {
+      const lastAgo = describeAge(lastMsg.time, Date.now());
+      statusBits.push(`最近一条来自 ${String(lastMsg.sender || '未知')}${lastAgo ? `（${lastAgo} 前）` : ''}：${String(lastMsg.text || lastMsg.plain || '').slice(0, 30)}`);
+    }
     if (lastMsg && looksLikeUnfinished(String(lastMsg.tail || lastMsg.plain || lastMsg.text || ''))) statusBits.push('对方可能没说完');
     if (lastAiMin != null) statusBits.push(`你上次发言 ${lastAiMin} 分钟前`);
     const statusLine = `【此刻状态】${statusBits.join('；')}\n\n`;
@@ -10446,7 +10774,14 @@ async function main() {
     const peakLine = peakBlockedFor(key, st)
       ? '【高峰时段策略】现在是高峰时段（只对群聊生效）：只做普通聊天，禁止调用任何外部工具（bili_* / web_search / web_fetch / 抓图）。有人让你查资料、搜东西、看链接、搬视频、扒数据，一律礼貌拒绝，并说明高峰时段不做这些、晚点再说。只有管理员（ownerQQ）明确要求时才可破例。\n\n'
       : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + peakLine;
+    // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
+    const timeSenseLine = buildTimeSenseLine(st);
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + peakLine + timeSenseLine;
+    // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
+    const triggeredSeq = wakeReasonSeq(reason);
+    const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
+    const triggeredAgo = triggeredMsg ? describeAge(triggeredMsg.time, Date.now()) : '';
+    const triggeredLine = triggeredAgo ? `（触发这条是 ${triggeredAgo} 前发的${triggeredMsg?.sender ? `，来自「${triggeredMsg.sender}」` : ''}，不是刚刚）` : '';
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -10454,7 +10789,10 @@ async function main() {
       return `${base}【唤醒】${key}\n原因：你设置的有限潜水时间已到；在你规定的时间内没有任何一项条件被触发，只是因为时间到了所以你被唤醒。\n你可以查看消息，或继续设置新的唤醒条件。`;
     }
     if (reason === 'replyCheck') {
-      return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，需要短静默就用 qq_wait_for_messages(purpose="reply") 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`;
+      const tail = preSleepGate
+        ? `已有回复时先看消息，需要短静默就用 qq_wait_for_messages(purpose="reply") 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`
+        : '有人回就先处理，处理完直接收尾（qq_mark_read 或 qq_set_wake_config）；没人回也不用硬补一句，直接收尾即可——桥接会在有新消息时再唤醒你，不要用 qq_wait_for_messages 守着等。';
+      return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n${tail}`;
     }
     if (reason === 'proactiveCheck') {
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
@@ -10462,7 +10800,10 @@ async function main() {
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
-    return `${base}【唤醒】${key}\n原因：${reason}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。`;
+    const sleepTail = preSleepGate
+      ? '决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。'
+      : '决定潜水就直接收尾（qq_mark_read 或 qq_set_wake_config），不要用 qq_wait_for_messages 守着等。';
+    return `${base}【唤醒】${key}\n原因：${reason}${triggeredLine}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；${sleepTail}`;
   }
 
   function buildWakeReminderPromptV2(key) {
@@ -10472,7 +10813,10 @@ async function main() {
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
+    const sleepNote = cfg.socialV2?.wake?.preSleepWaitEnabled === false
+      ? '本环境已关闭"沉睡前强制观察"：直接收尾即可，不要用 qq_wait_for_messages 守着等。'
+      : `注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
+    return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。${sleepNote}`;
   }
 
   async function sendWakePromptV2(key, reason) {

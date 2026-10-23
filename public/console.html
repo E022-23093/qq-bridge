@@ -2348,13 +2348,13 @@ button:active:not(:disabled) {
     <div class="row"><label style="flex:1">连续无动作上限（次）</label><input type="number" id="pcNoAction" min="0" step="1" style="max-width:120px"></div>
   </div></details>
 
-  <details class="settings-group"><summary>高峰时段策略（贵的时候只聊天，不干活）</summary><div class="settings-content">
+  <details class="settings-group"><summary>高峰时段提示（贵的时候只聊天，不干活）</summary><div class="settings-content">
     <div class="row"><label style="flex:1">启用</label><input type="checkbox" id="pcPeakEnabled" style="width:auto">
       <span class="meta" style="flex:2">按 DeepSeek 定价的北京时间判定高峰（与「令牌与花费」同一口径）</span></div>
-    <div class="row"><label style="flex:1">禁止外部工具</label><input type="checkbox" id="pcPeakBlockTools" style="width:auto">
-      <span class="meta" style="flex:2">高峰期间群聊只做普通对话：不查资料、不搜网页、不搬视频、不看链接</span></div>
+    <div class="row"><label style="flex:1">提示模型别用外部工具</label><input type="checkbox" id="pcPeakBlockTools" style="width:auto">
+      <span class="meta" style="flex:2">高峰期间在唤醒提示词里要求群聊只做普通对话（不查资料、不搜网页、不搬视频、不看链接）。这是<b>提示词约束</b>，桥接不拦工具调用；想硬性省钱请配合 <code>qq-tool-restrict</code> 或不要挂载对应 MCP。</span></div>
     <div class="row"><label style="flex:1">管理员可破例</label><input type="checkbox" id="pcPeakAllowOwner" style="width:auto">
-      <span class="meta" style="flex:2">最近一条消息来自管理员（ownerQQ）时，允许正常使用工具</span></div>
+      <span class="meta" style="flex:2">最近一条消息来自管理员（ownerQQ）时不加这段提示</span></div>
     <div class="meta">只对群聊生效；私聊不受影响。</div>
   </div></details>
 
@@ -2377,7 +2377,7 @@ button:active:not(:disabled) {
 
 <section id="section-schedule" data-page="schedule" class="card span-all">
   <h2>定时调度</h2>
-  <div class="meta">这些由独立的调度器进程执行（<code>scripts/scheduler.mjs</code>），保存后写入 config.json；<b>重启桥接（restart.bat）后调度器才会读到新配置</b>。所有时间都按本机本地时间，且只在 DeepSeek 的「空闲时段」里抽点。</div>
+  <div class="meta">这些由独立的调度器进程执行（<code>scripts/scheduler.mjs</code>），保存后写入 config.json；调度器每分钟重读一次配置，<b>下一轮心跳（≤60 秒）自动生效，不需要重启</b>。所有时间都按本机本地时间，且只在 DeepSeek 的「空闲时段」里抽点；当天已错过的时间点不会补发。</div>
 
   <details class="settings-group" open><summary>峰谷自动切人格（高峰用省钱的小人格卡，空闲用完整人设）</summary><div class="settings-content">
     <div class="row"><label style="flex:1">启用</label><input type="checkbox" id="scRolesEnabled" style="width:auto">
@@ -4808,7 +4808,7 @@ document.querySelector('.skip-link').addEventListener('click', event => {
 });
 /* ── 定时调度页 ────────────────────────────────────────────────────────────
  * 调度器是独立进程，配置存在 config.json 的 `scheduler` 段。
- * 这里只负责读写；改完要重启桥接（restart.bat）调度器才会读到。
+ * 这里只负责读写；调度器每分钟重读配置，下一轮心跳自动生效（不需要重启桥接）。
  */
 (function initScheduleUI(){
   const $ = (id) => document.getElementById(id);
@@ -4890,7 +4890,7 @@ document.querySelector('.skip-link').addEventListener('click', event => {
       say('保存中…');
       await api('/api/scheduler/config', 'POST', { config });
       showConsoleToast('调度配置已保存');
-      say('已保存 — 重启桥接后生效');
+      say('已保存 — 调度器下一轮心跳（≤60 秒）生效');
       await load();
     } catch (error) {
       say('保存失败：' + (error?.message || error));

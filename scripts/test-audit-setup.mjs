@@ -58,7 +58,7 @@ try {
       const doc = yaml.load(fs.readFileSync(f.patchFile, 'utf8'));
       const entries = doc.flatMap((op) => op.insert || []);
       assert.deepEqual(entries.find((entry) => entry.id === 'custom'), originalCustom);
-      for (const id of ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe']) {
+      for (const id of ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe', 'mcp-bili']) {
         assert.equal(entries.filter((entry) => entry.id === id).length, 1, `${id} duplicate`);
       }
       assert.equal(entries.find((entry) => entry.id === 'mcp-snowluma').config.toolCallTimeoutMs, 725000);

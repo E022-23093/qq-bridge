@@ -16,10 +16,16 @@ export const QUESTION_WORDS = [
   '寄了', '完了', '离谱', '逆天', '绷不住',
 ];
 
-/** 解压 + 转文本。 */
+/**
+ * 解压 + 转文本。
+ *
+ * 判定"已经是明文"时要求**以 XML 开头**，而不是只搜 `<d p=`：压缩流（尤其 brotli）
+ * 的字节里可能恰好包含这段 ASCII，直接返回就会得到一段乱码前缀 + 后面被截断的内容。
+ * 实测 bilibili 目前返回 deflate；这里多一层判断是为了不把"能凑巧解出来"当成成功。
+ */
 export function decodeMaybeCompressed(buf) {
   const direct = buf.toString('utf8');
-  if (direct.includes('<d p=')) return direct;
+  if (/^\uFEFF?\s*(?:<\?xml|<i[\s>])/i.test(direct)) return direct;
   for (const fn of [zlib.inflateRawSync, zlib.inflateSync, zlib.gunzipSync, zlib.brotliDecompressSync]) {
     try {
       const out = fn(buf).toString('utf8');

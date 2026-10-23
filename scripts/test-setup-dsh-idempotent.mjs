@@ -70,7 +70,7 @@ const finalPatch = fs.readFileSync(path.join(tmpHome, 'profiles', 'web', 'cordis
 
 // 断言 1：每个托管 id 恰好出现一次
 let failed = 0;
-for (const id of ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe']) {
+for (const id of ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe', 'mcp-bili']) {
   const n = finalPatch.split('\n').filter((l) => new RegExp(`^\\s*-\\s*id:\\s*${id}\\s*$`).test(l)).length;
   const ok = n === 1;
   if (!ok) failed += 1;

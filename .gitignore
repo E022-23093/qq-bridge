@@ -66,10 +66,3 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
-# 本地便携工具与凭据（便携版 gh 及其 token 配置）
-# 实际位置通常在工作区根目录（仓库外），这里加规则是为了挪进仓库时也不会误提交。
-/tools/
-/.gh-config/
-/tools/gh-config/
-gh-config/
-

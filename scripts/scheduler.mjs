@@ -359,7 +359,16 @@ async function fireChat(day, minute) {
   }
 }
 
+// 心跳重入保护：一次 tick 里有多处 await（HTTP + 超时），跑超过 60 秒时下一次心跳会进来；
+// 两边都看到「fired 里还没有这个槽位」，就会把同一场搬屎触发两次。
+let ticking = false;
+
 async function tick() {
+  if (ticking) {
+    log('上一轮还没跑完，跳过本次心跳');
+    return;
+  }
+  ticking = true;
   try {
     await syncRole();
     await guardContext();
@@ -380,6 +389,8 @@ async function tick() {
     }
   } catch (error) {
     log(`轮询异常：${error?.message ?? error}`);
+  } finally {
+    ticking = false;
   }
 }
 
