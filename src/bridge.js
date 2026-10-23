@@ -4374,6 +4374,94 @@ async function main() {
           return;
         }
         // ── 二代仿真模式（reserved2）内部 Agent API ─────────────────────────
+        // 按会话配置（控制台「按会话配置」页用）：列出所有会话 + 读取/写入单会话覆盖。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/conversation-list') {
+          const keys = new Set();
+          for (const k of Object.keys(cfg.socialV2?.conversations ?? {})) keys.add(k);
+          for (const k of Object.keys(state.sessions ?? {})) keys.add(k);
+          for (const k of socialV2.conversations.keys()) keys.add(k);
+          for (const g of cfg.allow?.groups ?? []) keys.add(`group:${String(g)}`);
+          for (const p of cfg.allow?.private ?? []) keys.add(`private:${String(p)}`);
+          const items = [...keys].filter((k) => /^(group|private):\d+$/.test(k)).sort().map((key) => {
+            const eff = socialV2For(key) ?? {};
+            return {
+              key,
+              wakeConfig: getSocialV2State(key)?.wakeConfig ?? null,
+              overrides: cfg.socialV2?.conversations?.[key] ?? {},
+              effective: {
+                burst: eff.burst ?? {},
+                contextGuard: eff.contextGuard ?? {},
+                send: eff.send ?? {},
+                wake: eff.wake ?? {},
+                ownerPing: eff.ownerPing ?? {}
+              }
+            };
+          });
+          sendJson({
+            ok: true,
+            items,
+            global: {
+              burst: cfg.socialV2?.burst ?? {},
+              contextGuard: cfg.socialV2?.contextGuard ?? {},
+              send: cfg.socialV2?.send ?? {},
+              wake: cfg.socialV2?.wake ?? {},
+              ownerPing: cfg.socialV2?.ownerPing ?? {}
+            }
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/conversation-config') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!/^(group|private):\d+$/.test(key)) {
+            sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400);
+            return;
+          }
+          // 只接受已知 section + 已知字段，数值做有限性校验，避免控制台写入脏数据。
+          const ALLOWED = {
+            burst: ['enabled', 'windowMs', 'probability', 'transitionMs', 'transitionProbability'],
+            contextGuard: ['enabled', 'maxTokens', 'cooldownMs'],
+            send: ['maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars'],
+            wake: ['maxWakePerMinute', 'maxWakePerHour', 'batchWindowMs', 'noActionLimit'],
+            ownerPing: ['enabled', 'keywords', 'cooldownMs', 'text']
+          };
+          const input = (body.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides))
+            ? body.overrides : {};
+          const clean = {};
+          for (const [section, fields] of Object.entries(ALLOWED)) {
+            const src = input[section];
+            if (!src || typeof src !== 'object' || Array.isArray(src)) continue;
+            const out = {};
+            for (const f of fields) {
+              if (!(f in src)) continue;
+              const v = src[f];
+              if (f === 'keywords') {
+                out[f] = (Array.isArray(v) ? v : [v]).map((x) => String(x ?? '').trim()).filter(Boolean).slice(0, 40);
+              } else if (f === 'text') {
+                out[f] = String(v ?? '').slice(0, 300);
+              } else if (f === 'enabled') {
+                out[f] = v === true;
+              } else {
+                const n = Number(v);
+                if (Number.isFinite(n) && n >= 0) out[f] = n;
+              }
+            }
+            if (Object.keys(out).length) clean[section] = out;
+          }
+          const configFile = path.join(ROOT, 'config.json');
+          const file = readConfigObject(configFile);
+          file.socialV2 = (file.socialV2 && typeof file.socialV2 === 'object' && !Array.isArray(file.socialV2)) ? file.socialV2 : {};
+          const conv = (file.socialV2.conversations && typeof file.socialV2.conversations === 'object' && !Array.isArray(file.socialV2.conversations))
+            ? file.socialV2.conversations : {};
+          if (Object.keys(clean).length) conv[key] = clean;
+          else delete conv[key];
+          file.socialV2.conversations = conv;
+          atomicWriteJson(configFile, file);
+          cfg.socialV2 = { ...(cfg.socialV2 ?? {}), conversations: conv };
+          log(`控制台：${key} 的按会话配置已更新（${Object.keys(clean).join(',') || '清空→改用全局默认'}）`);
+          sendJson({ ok: true, key, overrides: conv[key] ?? {} });
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/config') {
           sendJson({ ok: true, config: cfg.socialV2 ?? {} });
           return;

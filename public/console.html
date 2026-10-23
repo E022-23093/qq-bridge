@@ -1769,6 +1769,7 @@ button:active:not(:disabled) {
       <button data-view="persona" class="nav-item"><span class="nav-icon" aria-hidden="true">◉</span>人格与角色</button>
       <div class="nav-label">聊天行为</div>
       <button data-view="social-v2" class="nav-item"><span class="nav-icon" aria-hidden="true">◈</span>二代仿真<span class="nav-note">V2</span></button>
+      <button data-view="per-conv" class="nav-item"><span class="nav-icon" aria-hidden="true">⊞</span>按会话配置</button>
       <button data-view="social-v1" class="nav-item"><span class="nav-icon" aria-hidden="true">◇</span>一代仿真<span class="nav-note">V1</span></button>
       <button data-view="slang" class="nav-item"><span class="nav-icon" aria-hidden="true">▤</span>黑话词库</button>
       <div class="nav-label">管理</div>
@@ -2302,6 +2303,65 @@ button:active:not(:disabled) {
       <div class="meta" style="margin-top:4px">修改上面任意推荐/默认参数后，必须点这个按钮才会持久化；保存后会自动应用到仍使用默认唤醒配置的会话，重启后仍然保留。</div>
 
       </div></section>
+<section id="section-per-conv" data-page="per-conv" class="card span-all">
+  <h2>按会话配置</h2>
+  <div class="meta">每个群、每个私聊可以单独设置；留空表示沿用全局默认。保存后写入 config.json 并热更新，不需要重启桥接。唤醒条件改的是该会话自己的唤醒配置。</div>
+  <div class="row" style="margin-top:10px">
+    <label style="flex:1">选择会话</label>
+    <select id="pcKey" style="flex:2;max-width:460px"></select>
+    <button id="pcReload">刷新列表</button>
+  </div>
+  <div class="meta" id="pcGlobalHint" style="margin-top:6px">读取中…</div>
+
+  <details class="settings-group" open><summary>唤醒与潜水（这个会话什么时候会被叫醒）</summary><div class="settings-content">
+    <div class="row"><label style="flex:1">模式</label>
+      <select id="pcMode" style="flex:1"><option value="diving">潜水（按条件唤醒）</option><option value="active">活跃（每条消息都唤醒）</option></select></div>
+    <div class="row"><label style="flex:1">无限期潜水</label><input type="checkbox" id="pcInfinite" style="width:auto">
+      <span class="meta" style="flex:2">勾选=一直保持；不勾=按下方条件定时</span></div>
+    <div class="row"><label style="flex:1">被 @ 唤醒</label><input type="checkbox" id="pcAt" style="width:auto"></div>
+    <div class="row"><label style="flex:1">被叫名字唤醒</label><input type="checkbox" id="pcName" style="width:auto"></div>
+    <div class="row"><label style="flex:1">被提问唤醒</label><input type="checkbox" id="pcQuestion" style="width:auto"></div>
+    <div class="row"><label style="flex:1">被拍一拍唤醒</label><input type="checkbox" id="pcPoke" style="width:auto"></div>
+    <div class="row"><label style="flex:1">普通消息唤醒概率（0~1）</label><input type="number" id="pcProb" min="0" max="1" step="0.01" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">批量窗口（毫秒，越大越能合并连续消息）</label><input type="number" id="pcBatch" min="1000" step="500" style="max-width:140px"></div>
+  </div></details>
+
+  <details class="settings-group"><summary>三态窗口（活跃期 / 过渡期 / 静默）</summary><div class="settings-content">
+    <div class="row"><label style="flex:1">启用三态窗口</label><input type="checkbox" id="pcBurstEnabled" style="width:auto">
+      <span class="meta" style="flex:2">被点名后进入活跃期，随后转入过渡期，最后回到静默</span></div>
+    <div class="row"><label style="flex:1">活跃期时长（分钟）</label><input type="number" id="pcBurstWin" min="0" step="1" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">活跃期接话概率（0~1）</label><input type="number" id="pcBurstProb" min="0" max="1" step="0.01" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">过渡期时长（分钟）</label><input type="number" id="pcTransWin" min="0" step="1" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">过渡期接话概率（0~1）</label><input type="number" id="pcTransProb" min="0" max="1" step="0.01" style="max-width:120px"></div>
+  </div></details>
+
+  <details class="settings-group"><summary>上下文与限流（花多少钱、发多快）</summary><div class="settings-content">
+    <div class="row"><label style="flex:1">上下文超限自动重置</label><input type="checkbox" id="pcGuardEnabled" style="width:auto"></div>
+    <div class="row"><label style="flex:1">上下文阈值（token）</label><input type="number" id="pcGuardMax" min="10000" step="10000" style="max-width:140px"></div>
+    <div class="row"><label style="flex:1">重置冷却（分钟）</label><input type="number" id="pcGuardCooldown" min="1" step="1" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">每分钟最多发送（次）</label><input type="number" id="pcSendPerMin" min="0" step="1" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">每小时最多发送（次）</label><input type="number" id="pcSendPerHour" min="0" step="1" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">单条消息字数上限</label><input type="number" id="pcMaxChars" min="1" step="50" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">每分钟最多唤醒（次）</label><input type="number" id="pcWakePerMin" min="0" step="1" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">每小时最多唤醒（次）</label><input type="number" id="pcWakePerHour" min="0" step="1" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">连续无动作上限（次）</label><input type="number" id="pcNoAction" min="0" step="1" style="max-width:120px"></div>
+  </div></details>
+
+  <details class="settings-group"><summary>关注词（有人提到就 @ 管理员）</summary><div class="settings-content">
+    <div class="row"><label style="flex:1">启用关注词</label><input type="checkbox" id="pcPingEnabled" style="width:auto"></div>
+    <div class="row"><label style="flex:1">关键词（逗号分隔）</label><input type="text" id="pcPingKeywords" placeholder="压制境界, 道果" style="flex:2"></div>
+    <div class="row"><label style="flex:1">冷却（分钟）</label><input type="number" id="pcPingCooldown" min="0" step="1" style="max-width:120px"></div>
+    <div class="row"><label style="flex:1">提示文案（{kw} 会被替换成命中的词）</label><input type="text" id="pcPingText" placeholder="老大，有人问到「{kw}」的问题，你来看看" style="flex:2"></div>
+  </div></details>
+
+  <div class="row" style="margin-top:12px">
+    <button id="pcSave" style="font-weight:bold;padding:6px 16px">保存该会话配置</button>
+    <button id="pcClear" class="danger">清空 → 恢复全局默认</button>
+    <span class="meta" id="pcStatus"></span>
+  </div>
+  <div class="meta" style="margin-top:8px">提示：留空的输入框不会覆盖任何值；想“跟随全局”就点“清空”，之后该会话完全按全局配置走。</div>
+</section>
+
 <section id="section-slang" data-page="slang" class="card span-all">
       <h2>群聊黑话 / 网络用语库</h2>
       <div class="meta">DSH 会从群聊中自动提取疑似黑话候选；二代仿真模式下 AI 也可用 <code>qq_slang_submit</code> 主动提交陌生词。候选可批量送 DSH 深度联网研究，研究结果回到控制台由你删改修正后转正；确认后的词条会写入“黑话提示词”，注入一代/二代 AI 的聊天上下文，成为 AI 可查询和使用的记忆。</div>
@@ -4428,6 +4488,7 @@ const consolePages = {
   sessions: ['会话与审批', '让每一段对话，都有迹可循。', '查看 QQ 与 DSH 的会话映射，以及等待你回复的审批和提问。'],
   persona: ['人格与角色', '给你的伙伴，一点独特个性。', '选择已有角色，或用自己的语言写下新的性格与表达方式。'],
   'social-v2': ['二代仿真', '自主参与，恰到好处。', '管理 AI 的工具、唤醒与发言节奏。展开需要调整的分组，修改后保存参数。'],
+  'per-conv': ['按会话配置', '每个群、每个好友，各有一套规矩。', '为单个群或单个私聊单独设置唤醒、三态窗口、上下文阈值、限流与关注词；留空即沿用全局默认。'],
   'social-v1': ['一代仿真', '为自然对话，设定合适的节奏。', '调整参与概率、活跃周期和分条发送；所有配置项完整保留。'],
   slang: ['黑话词库', '读懂群聊里的，言外之意。', '从候选到确认，让 AI 逐渐熟悉大家的表达习惯。'],
   usage: ['令牌与花费', '每一次思考，都算得清楚。', '实时查看 AI 的 token 消耗与花费，可下钻到每个群、每个好友、每一轮对话。'],
@@ -4474,6 +4535,208 @@ window.addEventListener('hashchange', () => {
   const page = location.hash.slice(1);
   if (Object.hasOwn(consolePages, page) || !page) setConsolePage(page, { updateHash: false });
 });
+
+/* ── 按会话配置页 ──────────────────────────────────────────────────────────
+ * 一个会话的"设置"分两处存：
+ *   1) 唤醒配置（wakeConfig）——按会话存在 state/socialV2 里，走 /api/socialV2/wake-config
+ *   2) 覆盖项（conversations[key]）——存在 config.json，走 /api/socialV2/conversation-config
+ * 这里把两者合成一张表；保存时只写"与全局不同"的字段，相同的自动省略（= 跟随全局）。
+ */
+(function initPerConversation(){
+  const $ = (id) => document.getElementById(id);
+  if (!$('pcKey')) return;
+  let items = [];
+  let globalCfg = {};
+
+  const val = (id) => $(id).value.trim();
+  const numOf = (id) => { const v = val(id); if (v === '') return undefined; const n = Number(v); return Number.isFinite(n) ? n : undefined; };
+  const pick = (a, b) => (a === undefined ? b : a);
+
+  function fmtGlobal(g) {
+    if (!g || !g.burst) return '全局配置读取中…';
+    const mins = (ms) => Math.round(Number(ms || 0) / 60000);
+    const pct = (x) => Math.round(Number(x || 0) * 100);
+    return `全局默认：活跃 ${mins(g.burst.windowMs)} 分钟 / ${pct(g.burst.probability)}%，过渡 ${mins(g.burst.transitionMs)} 分钟 / ${pct(g.burst.transitionProbability)}%；上下文 ${g.contextGuard?.maxTokens || '-'} token；发送 ${g.send?.maxSendPerMinute || '-'}/分、${g.send?.maxSendPerHour || '-'}/时；唤醒 ${g.wake?.maxWakePerMinute || '-'}/分、${g.wake?.maxWakePerHour || '-'}/时`;
+  }
+
+  function renderStatus(text) { if ($('pcStatus')) $('pcStatus').textContent = text || ''; }
+
+  function fillList() {
+    const sel = $('pcKey');
+    const prev = sel.value;
+    sel.innerHTML = '';
+    for (const it of items) {
+      const o = document.createElement('option');
+      o.value = it.key;
+      const overridden = it.overrides && Object.keys(it.overrides).length > 0;
+      o.textContent = it.key + (overridden ? '（已单独配置）' : '');
+      sel.appendChild(o);
+    }
+    if (prev && items.some((x) => x.key === prev)) sel.value = prev;
+  }
+
+  function current() { const k = $('pcKey').value; return items.find((x) => x.key === k) || null; }
+
+  function render() {
+    $('pcGlobalHint').textContent = fmtGlobal(globalCfg);
+    const it = current();
+    if (!it) { renderStatus('没有可配置的会话'); return; }
+    const g = globalCfg || {};
+    const ov = it.overrides || {};
+    const b = { ...(g.burst || {}), ...(ov.burst || {}) };
+    const cg = { ...(g.contextGuard || {}), ...(ov.contextGuard || {}) };
+    const sd = { ...(g.send || {}), ...(ov.send || {}) };
+    const wk = { ...(g.wake || {}), ...(ov.wake || {}) };
+    const op = { ...(g.ownerPing || {}), ...(ov.ownerPing || {}) };
+    const wc = it.wakeConfig || {};
+    const tr = wc.triggers || {};
+
+    $('pcMode').value = wc.mode || 'diving';
+    $('pcInfinite').checked = wc.infinite !== false;
+    $('pcAt').checked = tr.atMention !== false;
+    $('pcName').checked = tr.nameMention !== false;
+    $('pcQuestion').checked = tr.question !== false;
+    $('pcPoke').checked = tr.poke !== false;
+    $('pcProb').value = tr.probability ?? 0;
+    $('pcBatch').value = wc.batchWindowMs || 10000;
+
+    $('pcBurstEnabled').checked = b.enabled !== false;
+    $('pcBurstWin').value = Math.round(Number(b.windowMs || 180000) / 60000);
+    $('pcBurstProb').value = b.probability ?? 0.3;
+    $('pcTransWin').value = Math.round(Number(b.transitionMs || 1800000) / 60000);
+    $('pcTransProb').value = b.transitionProbability ?? 0.1;
+
+    $('pcGuardEnabled').checked = cg.enabled !== false;
+    $('pcGuardMax').value = cg.maxTokens || 50000;
+    $('pcGuardCooldown').value = Math.round(Number(cg.cooldownMs || 600000) / 60000);
+
+    $('pcSendPerMin').value = sd.maxSendPerMinute ?? 20;
+    $('pcSendPerHour').value = sd.maxSendPerHour ?? 240;
+    $('pcMaxChars').value = sd.maxMessageChars ?? 500;
+    $('pcWakePerMin').value = wk.maxWakePerMinute ?? 6;
+    $('pcWakePerHour').value = wk.maxWakePerHour ?? 120;
+    $('pcNoAction').value = wk.noActionLimit ?? 6;
+
+    $('pcPingEnabled').checked = op.enabled !== false;
+    $('pcPingKeywords').value = Array.isArray(op.keywords) ? op.keywords.join(', ') : '';
+    $('pcPingCooldown').value = Math.round(Number(op.cooldownMs || 600000) / 60000);
+    $('pcPingText').value = op.text || '老大，有人问到「{kw}」的问题，你来看看';
+
+    renderStatus('已载入 ' + it.key);
+  }
+
+  function collect() {
+    const g = globalCfg || {};
+    const gb = g.burst || {}, gc = g.contextGuard || {}, gs = g.send || {}, gw = g.wake || {}, go = g.ownerPing || {};
+    const out = {};
+
+    // 三态窗口：只写与全局不同的字段
+    const burst = {};
+    if ($('pcBurstEnabled').checked !== (gb.enabled !== false)) burst.enabled = $('pcBurstEnabled').checked;
+    const bw = numOf('pcBurstWin'); if (bw !== undefined && bw * 60000 !== Number(gb.windowMs)) burst.windowMs = Math.round(bw * 60000);
+    const bp = numOf('pcBurstProb'); if (bp !== undefined && bp !== Number(gb.probability)) burst.probability = bp;
+    const tw = numOf('pcTransWin'); if (tw !== undefined && tw * 60000 !== Number(gb.transitionMs)) burst.transitionMs = Math.round(tw * 60000);
+    const tp = numOf('pcTransProb'); if (tp !== undefined && tp !== Number(gb.transitionProbability)) burst.transitionProbability = tp;
+    if (Object.keys(burst).length) out.burst = burst;
+
+    const guard = {};
+    if ($('pcGuardEnabled').checked !== (gc.enabled !== false)) guard.enabled = $('pcGuardEnabled').checked;
+    const gm = numOf('pcGuardMax'); if (gm !== undefined && gm !== Number(gc.maxTokens)) guard.maxTokens = gm;
+    const gcd = numOf('pcGuardCooldown'); if (gcd !== undefined && Math.round(gcd * 60000) !== Number(gc.cooldownMs)) guard.cooldownMs = Math.round(gcd * 60000);
+    if (Object.keys(guard).length) out.contextGuard = guard;
+
+    const send = {};
+    const spm = numOf('pcSendPerMin'); if (spm !== undefined && spm !== Number(gs.maxSendPerMinute)) send.maxSendPerMinute = spm;
+    const sph = numOf('pcSendPerHour'); if (sph !== undefined && sph !== Number(gs.maxSendPerHour)) send.maxSendPerHour = sph;
+    const mc = numOf('pcMaxChars'); if (mc !== undefined && mc !== Number(gs.maxMessageChars)) send.maxMessageChars = mc;
+    if (Object.keys(send).length) out.send = send;
+
+    const wake = {};
+    const wpm = numOf('pcWakePerMin'); if (wpm !== undefined && wpm !== Number(gw.maxWakePerMinute)) wake.maxWakePerMinute = wpm;
+    const wph = numOf('pcWakePerHour'); if (wph !== undefined && wph !== Number(gw.maxWakePerHour)) wake.maxWakePerHour = wph;
+    const na = numOf('pcNoAction'); if (na !== undefined && na !== Number(gw.noActionLimit)) wake.noActionLimit = na;
+    if (Object.keys(wake).length) out.wake = wake;
+
+    const ping = {};
+    if ($('pcPingEnabled').checked !== (go.enabled !== false)) ping.enabled = $('pcPingEnabled').checked;
+    const kws = val('pcPingKeywords').split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+    if (kws.join(',') !== (go.keywords || []).join(',')) ping.keywords = kws;
+    const pcd = numOf('pcPingCooldown'); if (pcd !== undefined && Math.round(pcd * 60000) !== Number(go.cooldownMs)) ping.cooldownMs = Math.round(pcd * 60000);
+    const ptext = val('pcPingText'); if (ptext && ptext !== (go.text || '')) ping.text = ptext;
+    if (Object.keys(ping).length) out.ownerPing = ping;
+
+    return out;
+  }
+
+  async function load() {
+    try {
+      renderStatus('读取中…');
+      const r = await api('/api/socialV2/conversation-list');
+      items = r.items || [];
+      globalCfg = r.global || {};
+      fillList();
+      if (items.length) render(); else renderStatus('还没有任何会话（群里/私聊说过话之后会出现）');
+    } catch (error) {
+      renderStatus('读取失败：' + (error?.message || error));
+    }
+  }
+
+  async function save() {
+    const it = current();
+    if (!it) return;
+    const overrides = collect();
+    try {
+      renderStatus('保存中…');
+      await api('/api/socialV2/conversation-config', 'POST', { key: it.key, overrides });
+
+      // 唤醒条件（每会话状态）
+      const wc = {
+        mode: $('pcMode').value,
+        infinite: $('pcInfinite').checked,
+        triggers: {
+          atMention: $('pcAt').checked,
+          nameMention: $('pcName').checked,
+          question: $('pcQuestion').checked,
+          poke: $('pcPoke').checked,
+          probability: numOf('pcProb') ?? 0
+        },
+        batchWindowMs: numOf('pcBatch') ?? 10000
+      };
+      if (!wc.infinite) { wc.sleepMs = 30 * 60 * 1000; }
+      await api('/api/socialV2/wake-config', 'POST', { key: it.key, config: wc });
+
+      showConsoleToast('已保存 ' + it.key);
+      renderStatus('已保存（' + (Object.keys(overrides).join('、') || '无覆盖项，全部跟随全局') + '）');
+      await load();
+    } catch (error) {
+      renderStatus('保存失败：' + (error?.message || error));
+      showConsoleToast('保存失败：' + (error?.message || error));
+    }
+  }
+
+  async function clearOverrides() {
+    const it = current();
+    if (!it) return;
+    if (!confirm('清空 ' + it.key + ' 的所有单独配置？之后它将完全跟随全局默认。')) return;
+    try {
+      await api('/api/socialV2/conversation-config', 'POST', { key: it.key, overrides: {} });
+      showConsoleToast('已清空 ' + it.key + ' 的单独配置');
+      await load();
+    } catch (error) {
+      renderStatus('清空失败：' + (error?.message || error));
+    }
+  }
+
+  $('pcKey').addEventListener('change', render);
+  $('pcReload').addEventListener('click', load);
+  $('pcSave').addEventListener('click', save);
+  $('pcClear').addEventListener('click', clearOverrides);
+
+  // 进入该页时加载（点导航或直接带 hash 打开）
+  document.querySelectorAll('[data-view="per-conv"]').forEach((btn) => btn.addEventListener('click', () => { setTimeout(load, 30); }));
+  if (location.hash === '#per-conv') setTimeout(load, 200);
+})();
+
 document.querySelector('.skip-link').addEventListener('click', event => {
   event.preventDefault();
   document.getElementById('mainContent').focus();
