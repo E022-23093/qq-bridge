@@ -2360,6 +2360,8 @@ button:active:not(:disabled) {
   <details class="settings-group"><summary>关注词（有人提到就 @ 管理员）</summary><div class="settings-content">
     <div class="row"><label style="flex:1">启用关注词</label><input type="checkbox" id="pcPingEnabled" style="width:auto"></div>
     <div class="row"><label style="flex:1">关键词（逗号分隔）</label><input type="text" id="pcPingKeywords" placeholder="压制境界, 道果" style="flex:2"></div>
+    <div class="row"><label style="flex:1">仅问句 / 质疑时 @</label><input type="checkbox" id="pcPingRequireQuestion" style="width:auto">
+      <span class="meta" style="flex:2">只在关键词所在句子里有问号、疑问词（吗/什么/怎么/是不是…）或质疑词（假的/骗/离谱…）时才 @；纯陈述不打扰。纯字符串匹配，不花 token。</span></div>
     <div class="row"><label style="flex:1">冷却（分钟）</label><input type="number" id="pcPingCooldown" min="0" step="1" style="max-width:120px"></div>
     <div class="row"><label style="flex:1">提示文案（{kw} 会被替换成命中的词）</label><input type="text" id="pcPingText" placeholder="老大，有人问到「{kw}」的问题，你来看看" style="flex:2"></div>
   </div></details>
@@ -4629,6 +4631,7 @@ window.addEventListener('hashchange', () => {
     $('pcNoAction').value = wk.noActionLimit ?? 6;
 
     $('pcPingEnabled').checked = op.enabled !== false;
+    $('pcPingRequireQuestion').checked = op.requireQuestion !== false;
     $('pcPingKeywords').value = Array.isArray(op.keywords) ? op.keywords.join(', ') : '';
     $('pcPingCooldown').value = Math.round(Number(op.cooldownMs || 600000) / 60000);
     $('pcPingText').value = op.text || '老大，有人问到「{kw}」的问题，你来看看';
@@ -4678,6 +4681,7 @@ window.addEventListener('hashchange', () => {
     if (kws.join(',') !== (go.keywords || []).join(',')) ping.keywords = kws;
     const pcd = numOf('pcPingCooldown'); if (pcd !== undefined && Math.round(pcd * 60000) !== Number(go.cooldownMs)) ping.cooldownMs = Math.round(pcd * 60000);
     const ptext = val('pcPingText'); if (ptext && ptext !== (go.text || '')) ping.text = ptext;
+    if ($('pcPingRequireQuestion').checked !== (go.requireQuestion !== false)) ping.requireQuestion = $('pcPingRequireQuestion').checked;
     if (Object.keys(ping).length) out.ownerPing = ping;
 
     // 高峰时段策略

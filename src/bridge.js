@@ -4425,7 +4425,7 @@ async function main() {
             contextGuard: ['enabled', 'maxTokens', 'cooldownMs'],
             send: ['maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars'],
             wake: ['maxWakePerMinute', 'maxWakePerHour', 'batchWindowMs', 'noActionLimit'],
-            ownerPing: ['enabled', 'keywords', 'cooldownMs', 'text'],
+            ownerPing: ['enabled', 'keywords', 'cooldownMs', 'text', 'requireQuestion', 'questionWords', 'challengeWords'],
             peakPolicy: ['enabled', 'blockExternalTools', 'allowOwner']
           };
           const input = (body.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides))
@@ -4438,11 +4438,11 @@ async function main() {
             for (const f of fields) {
               if (!(f in src)) continue;
               const v = src[f];
-              if (f === 'keywords') {
+              if (f === 'keywords' || f === 'questionWords' || f === 'challengeWords') {
                 out[f] = (Array.isArray(v) ? v : [v]).map((x) => String(x ?? '').trim()).filter(Boolean).slice(0, 40);
               } else if (f === 'text') {
                 out[f] = String(v ?? '').slice(0, 300);
-              } else if (f === 'enabled' || f === 'blockExternalTools' || f === 'allowOwner') {
+              } else if (f === 'enabled' || f === 'blockExternalTools' || f === 'allowOwner' || f === 'requireQuestion') {
                 out[f] = v === true;
               } else {
                 const n = Number(v);
@@ -10078,6 +10078,45 @@ async function main() {
    * 命中后同时开启活跃期/过渡期，让随后的讨论自然接上。
    */
   const ownerPingCooldown = new Map();
+  /**
+   * 关注词质量判断：只有「问句 / 质疑」才值得叫管理员，纯陈述就放过。
+   *
+   * 全程纯字符串匹配，零 token、零模型调用。判定范围是**关键词所在的那一句**
+   * （按 。！？!?；;\n 切句），避免把别的句子的问号算进来。
+   *
+   * 命中任一即视为"值得 @"：
+   *   - 问号（? ？）
+   *   - 疑问词（吗/呢/什么/怎么/为什么/是不是/有没有/能不能/到底/谁/哪/真假/真的/确定）
+   *   - 质疑词（假的/骗/扯/胡扯/离谱/不可能/笑死/不信/水/编的）
+   */
+  function ownerPingQualityV2(text, hit, p) {
+    const raw = String(text ?? '');
+    const idx = raw.indexOf(hit);
+    if (idx < 0) return { ok: false, why: 'no-hit' };
+    // 取出关键词所在的那一句（以中英文句末标点/换行为界）
+    const sep = /[。！？!?；;\n]/;
+    let start = idx;
+    while (start > 0 && !sep.test(raw[start - 1])) start--;
+    let end = idx + hit.length;
+    while (end < raw.length && !sep.test(raw[end])) end++;
+    const sentence = raw.slice(start, end + 1);
+
+    const questionRe = /[?？]/;
+    const questionWords = Array.isArray(p.questionWords) && p.questionWords.length
+      ? p.questionWords
+      : ['吗', '呢', '什么', '怎么', '为什么', '是不是', '有没有', '能不能', '到底', '谁', '哪', '真假', '真的', '确定'];
+    const challengeWords = Array.isArray(p.challengeWords) && p.challengeWords.length
+      ? p.challengeWords
+      : ['假的', '骗', '扯', '胡扯', '离谱', '不可能', '笑死', '不信', '编的'];
+
+    if (questionRe.test(sentence)) return { ok: true, why: 'question-mark', sentence };
+    const q = questionWords.find((w) => w && sentence.includes(String(w)));
+    if (q) return { ok: true, why: `question-word:${q}`, sentence };
+    const c = challengeWords.find((w) => w && sentence.includes(String(w)));
+    if (c) return { ok: true, why: `challenge:${c}`, sentence };
+    return { ok: false, why: 'statement', sentence };
+  }
+
   async function maybeOwnerPingV2(key, st, plainContent, kind) {
     if (kind !== 'group') return false;
     const p = socialV2For(key)?.ownerPing ?? {};
@@ -10087,6 +10126,14 @@ async function main() {
     const text = String(plainContent ?? '');
     const hit = kws.find((k) => text.includes(k));
     if (!hit) return false;
+    // 只有问句/质疑才叫管理员；纯陈述（"我今天在练压制境界"）不打扰。
+    if (p.requireQuestion !== false) {
+      const quality = ownerPingQualityV2(text, hit, p);
+      if (!quality.ok) {
+        log(`[reserved2] 关注词「${hit}」出现在陈述句里，跳过 @（${quality.why}）`);
+        return false;
+      }
+    }
     const owner = String(cfg.ownerQQ ?? '').trim();
     if (!owner) return false;
     const cooldown = Math.max(0, Number(p.cooldownMs) || 10 * 60 * 1000);
@@ -10101,7 +10148,7 @@ async function main() {
       { type: 'at', data: { qq: owner } },
       { type: 'text', data: { text: ' ' + content } }
     ]);
-    log(`[reserved2] 关注词「${hit}」命中：已 @ 管理员 ${owner}，并开启活跃期`);
+    log(`[reserved2] 关注词「${hit}」命中（${ownerPingQualityV2(text, hit, p).why}）：已 @ 管理员 ${owner}，并开启活跃期`);
     appendActivity(`${key} [关注词] 命中「${hit}」，已 @ 管理员`);
     return true;
   }

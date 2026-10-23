@@ -258,6 +258,7 @@
       "enabled": true,
       "keywords": [],
       "cooldownMs": 600000,
+      "requireQuestion": true,
       "text": "老大，有人问到「{kw}」的问题，你来看看"
     },
     "conversations": {},
