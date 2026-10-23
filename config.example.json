@@ -249,6 +249,11 @@
       "maxTokens": 50000,
       "cooldownMs": 600000
     },
+    "peakPolicy": {
+      "enabled": true,
+      "blockExternalTools": true,
+      "allowOwner": true
+    },
     "ownerPing": {
       "enabled": true,
       "keywords": [],

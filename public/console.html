@@ -2347,6 +2347,16 @@ button:active:not(:disabled) {
     <div class="row"><label style="flex:1">连续无动作上限（次）</label><input type="number" id="pcNoAction" min="0" step="1" style="max-width:120px"></div>
   </div></details>
 
+  <details class="settings-group"><summary>高峰时段策略（贵的时候只聊天，不干活）</summary><div class="settings-content">
+    <div class="row"><label style="flex:1">启用</label><input type="checkbox" id="pcPeakEnabled" style="width:auto">
+      <span class="meta" style="flex:2">按 DeepSeek 定价的北京时间判定高峰（与「令牌与花费」同一口径）</span></div>
+    <div class="row"><label style="flex:1">禁止外部工具</label><input type="checkbox" id="pcPeakBlockTools" style="width:auto">
+      <span class="meta" style="flex:2">高峰期间群聊只做普通对话：不查资料、不搜网页、不搬视频、不看链接</span></div>
+    <div class="row"><label style="flex:1">管理员可破例</label><input type="checkbox" id="pcPeakAllowOwner" style="width:auto">
+      <span class="meta" style="flex:2">最近一条消息来自管理员（ownerQQ）时，允许正常使用工具</span></div>
+    <div class="meta">只对群聊生效；私聊不受影响。</div>
+  </div></details>
+
   <details class="settings-group"><summary>关注词（有人提到就 @ 管理员）</summary><div class="settings-content">
     <div class="row"><label style="flex:1">启用关注词</label><input type="checkbox" id="pcPingEnabled" style="width:auto"></div>
     <div class="row"><label style="flex:1">关键词（逗号分隔）</label><input type="text" id="pcPingKeywords" placeholder="压制境界, 道果" style="flex:2"></div>
@@ -4588,6 +4598,7 @@ window.addEventListener('hashchange', () => {
     const sd = { ...(g.send || {}), ...(ov.send || {}) };
     const wk = { ...(g.wake || {}), ...(ov.wake || {}) };
     const op = { ...(g.ownerPing || {}), ...(ov.ownerPing || {}) };
+    const pp = { ...(g.peakPolicy || {}), ...(ov.peakPolicy || {}) };
     const wc = it.wakeConfig || {};
     const tr = wc.triggers || {};
 
@@ -4621,6 +4632,10 @@ window.addEventListener('hashchange', () => {
     $('pcPingKeywords').value = Array.isArray(op.keywords) ? op.keywords.join(', ') : '';
     $('pcPingCooldown').value = Math.round(Number(op.cooldownMs || 600000) / 60000);
     $('pcPingText').value = op.text || '老大，有人问到「{kw}」的问题，你来看看';
+
+    $('pcPeakEnabled').checked = pp.enabled !== false;
+    $('pcPeakBlockTools').checked = pp.blockExternalTools !== false;
+    $('pcPeakAllowOwner').checked = pp.allowOwner !== false;
 
     renderStatus('已载入 ' + it.key);
   }
@@ -4664,6 +4679,14 @@ window.addEventListener('hashchange', () => {
     const pcd = numOf('pcPingCooldown'); if (pcd !== undefined && Math.round(pcd * 60000) !== Number(go.cooldownMs)) ping.cooldownMs = Math.round(pcd * 60000);
     const ptext = val('pcPingText'); if (ptext && ptext !== (go.text || '')) ping.text = ptext;
     if (Object.keys(ping).length) out.ownerPing = ping;
+
+    // 高峰时段策略
+    const gp = (globalCfg || {}).peakPolicy || {};
+    const peak = {};
+    if ($('pcPeakEnabled').checked !== (gp.enabled !== false)) peak.enabled = $('pcPeakEnabled').checked;
+    if ($('pcPeakBlockTools').checked !== (gp.blockExternalTools !== false)) peak.blockExternalTools = $('pcPeakBlockTools').checked;
+    if ($('pcPeakAllowOwner').checked !== (gp.allowOwner !== false)) peak.allowOwner = $('pcPeakAllowOwner').checked;
+    if (Object.keys(peak).length) out.peakPolicy = peak;
 
     return out;
   }

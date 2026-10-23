@@ -26,7 +26,7 @@ import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, in
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
-import { resolvePriceTable } from './model-prices.js';
+import { resolvePriceTable, isPeakAt } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import {
   loadSlang,
@@ -4393,7 +4393,8 @@ async function main() {
                 contextGuard: eff.contextGuard ?? {},
                 send: eff.send ?? {},
                 wake: eff.wake ?? {},
-                ownerPing: eff.ownerPing ?? {}
+                ownerPing: eff.ownerPing ?? {},
+                peakPolicy: eff.peakPolicy ?? {}
               }
             };
           });
@@ -4405,7 +4406,8 @@ async function main() {
               contextGuard: cfg.socialV2?.contextGuard ?? {},
               send: cfg.socialV2?.send ?? {},
               wake: cfg.socialV2?.wake ?? {},
-              ownerPing: cfg.socialV2?.ownerPing ?? {}
+              ownerPing: cfg.socialV2?.ownerPing ?? {},
+              peakPolicy: cfg.socialV2?.peakPolicy ?? {}
             }
           });
           return;
@@ -4423,7 +4425,8 @@ async function main() {
             contextGuard: ['enabled', 'maxTokens', 'cooldownMs'],
             send: ['maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars'],
             wake: ['maxWakePerMinute', 'maxWakePerHour', 'batchWindowMs', 'noActionLimit'],
-            ownerPing: ['enabled', 'keywords', 'cooldownMs', 'text']
+            ownerPing: ['enabled', 'keywords', 'cooldownMs', 'text'],
+            peakPolicy: ['enabled', 'blockExternalTools', 'allowOwner']
           };
           const input = (body.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides))
             ? body.overrides : {};
@@ -4439,7 +4442,7 @@ async function main() {
                 out[f] = (Array.isArray(v) ? v : [v]).map((x) => String(x ?? '').trim()).filter(Boolean).slice(0, 40);
               } else if (f === 'text') {
                 out[f] = String(v ?? '').slice(0, 300);
-              } else if (f === 'enabled') {
+              } else if (f === 'enabled' || f === 'blockExternalTools' || f === 'allowOwner') {
                 out[f] = v === true;
               } else {
                 const n = Number(v);
@@ -9712,6 +9715,8 @@ async function main() {
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
   function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
     const st = getSocialV2State(key);
+    // 记录最近一条消息是不是管理员发的：高峰时段策略要用它判断能不能破例。
+    st.lastInboundIsOwner = isOwner === true;
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
     // 存储层的归一化**不能只留 kind/file/url/faceId**：reserved2 的图片/表情工具
@@ -9988,6 +9993,31 @@ async function main() {
         : v;
     }
     return out;
+  }
+
+  /**
+   * 高峰时段策略：高峰期间群聊只允许普通对话，禁止调用外部工具。
+   *
+   * 为什么放在桥接：这是"什么时候不该花钱"的运行时判断，和价目表同源（isPeakAt）。
+   * 判定顺序：只管群聊 → 策略开关 → 管理员例外 → 是否高峰。
+   * 管理员例外的依据是 `st.lastInboundIsOwner`（最近一条入站消息是否来自 ownerQQ）。
+   */
+  function peakPolicyFor(key) {
+    const p = socialV2For(key)?.peakPolicy ?? {};
+    return {
+      enabled: p.enabled !== false,
+      blockExternalTools: p.blockExternalTools !== false,
+      allowOwner: p.allowOwner !== false
+    };
+  }
+
+  function peakBlockedFor(key, st) {
+    const keyStr = String(key ?? '');
+    if (!keyStr.startsWith('group:')) return false;
+    const policy = peakPolicyFor(key);
+    if (!policy.enabled || !policy.blockExternalTools) return false;
+    if (policy.allowOwner && st?.lastInboundIsOwner) return false;
+    return isPeakAt(Date.now());
   }
 
   function armActiveV2(key, st) {
@@ -10299,7 +10329,10 @@ async function main() {
     // 后续唤醒不再带它 —— 那时它已经在这条 DSH 会话的上下文里了。
     const initialPromptText = reason === 'bootstrap' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
+    const peakLine = peakBlockedFor(key, st)
+      ? '【高峰时段策略】现在是高峰时段（只对群聊生效）：只做普通聊天，禁止调用任何外部工具（bili_* / web_search / web_fetch / 抓图）。有人让你查资料、搜东西、看链接、搬视频、扒数据，一律礼貌拒绝，并说明高峰时段不做这些、晚点再说。只有管理员（ownerQQ）明确要求时才可破例。\n\n'
+      : '';
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + peakLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
