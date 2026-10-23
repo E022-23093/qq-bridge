@@ -164,6 +164,7 @@ const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  'mcp__bili__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，

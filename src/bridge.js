@@ -3108,6 +3108,29 @@ async function main() {
       return !!st && !!st.agentToken && tokenEq(token, st.agentToken);
     };
     /**
+     * 允许「管理员私聊」把话发到群里（跨会话委托）。
+     *
+     * 为什么需要：qq_send_message 的令牌是和**目标会话**绑定的，私聊里拿到的令牌
+     * 无法发到群里。但真实用法是"老大在私聊说：去某个群说句什么"。
+     * 这里只放开一条窄路：**只有 ownerQQ 的私聊令牌**、且目标是**白名单里的群**。
+     * 非管理员的私聊、以及私聊之外的任何目标，仍然走原来的严格绑定。
+     */
+    const agentTokenOkOrOwnerDelegate = (key, token) => {
+      if (agentTokenOk(key, token)) return true;
+      const k = String(key ?? '');
+      if (!k.startsWith('group:')) return false;
+      const owner = String(cfg.ownerQQ ?? '').trim();
+      if (!owner) return false;
+      const ownerKey = `private:${owner}`;
+      const stOwner = socialV2.conversations.get(ownerKey);
+      if (!stOwner?.agentToken || !tokenEq(token, stOwner.agentToken)) return false;
+      const gid = Number(k.slice('group:'.length));
+      if (!Number.isFinite(gid) || gid <= 0) return false;
+      if (!allowed('group', gid, cfg)) return false;
+      log(`[委托] 管理员私聊令牌向群 ${gid} 发送（跨会话委托）`);
+      return true;
+    };
+    /**
      * 令牌是否匹配**任意**一个活跃二代会话。
      *
      * 用途是集中式纵深防御（见下方 x-agent-call 关卡）：各端点自己那套
@@ -6824,7 +6847,7 @@ async function main() {
             return;
           }
           if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (token && !agentTokenOkOrOwnerDelegate(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           const flag = isPrivate ? 'sendPrivate' : (isReply ? 'reply' : 'sendGroup');
           if (token && !v2ToolEnabled(flag)) { sendJson({ ok: false, error: `工具未启用：${flag}` }, 403); return; }
           if (shouldBlockSilentReply(key)) {
@@ -6855,7 +6878,7 @@ async function main() {
             quotedInfo = resolved.info;
             actualReplyToMessageId = resolved.messageId;
           }
-          const sendCfg = cfg.socialV2?.send ?? {};
+          const sendCfg = socialV2For(key)?.send ?? {};
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
           if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
           if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
@@ -9843,19 +9866,143 @@ async function main() {
     return text;
   }
 
+  /**
+   * 三态唤醒策略（静默 → 活跃 → 过渡 → 静默）。
+   *
+   * 为什么需要：v2 的 `mode: active` 在桥接里是**无限期**的（设置时强制 infinite=true），
+   * 没有"活跃几分钟后自动收回"的语义。而实际使用中最自然的模式是：
+   *   1) 平时完全静默：不 @ 它就不说话（普通消息 0%）；
+   *   2) 被 @ / 叫名字 / 直接提问 → 进入**活跃期**（默认 3 分钟），期间普通消息按较高概率接；
+   *   3) 活跃期结束后进入**过渡期**（默认 1 小时），概率低于活跃期，聊得动就慢慢收尾。
+   * 两个窗口都是**滑动**的：期间只要有人说话，就把到期时间往后推。
+   *
+   * 实现方式：命中"点名类"触发时打 `st.burstUntil` / `st.transitionUntil` 时间戳，
+   * 只在会话状态里，不改 wakeConfig，也不影响潜水/唤醒配置本身。
+   */
+  /**
+   * 按会话取 socialV2 配置：全局默认 + `config.socialV2.conversations[<key>]` 的覆盖。
+   *
+   * 为什么要这层：三态窗口、限流、关注词、上下文阈值这些原先都是全局的，
+   * 但真实需求是"每个群/每个号可以不一样"（比如 A 群活跃、B 群闭嘴、私聊更省）。
+   * 合并只做两级：section（burst/send/wake/ownerPing…）整体替换，section 内部再合并一次。
+   */
+  function socialV2For(key) {
+    const base = cfg.socialV2 ?? {};
+    const table = base.conversations;
+    const ov = table && typeof table === 'object' ? table[String(key ?? '')] : null;
+    if (!ov || typeof ov !== 'object' || Array.isArray(ov)) return base;
+    const out = { ...base };
+    delete out.conversations;
+    for (const [k, v] of Object.entries(ov)) {
+      const b = base[k];
+      out[k] = (v && typeof v === 'object' && !Array.isArray(v) && b && typeof b === 'object' && !Array.isArray(b))
+        ? { ...b, ...v }
+        : v;
+    }
+    return out;
+  }
+
+  function armActiveV2(key, st) {
+    if (!st) return;
+    const b = socialV2For(key)?.burst ?? {};
+    if (b.enabled === false) return;
+    const ms = Math.max(0, Number(b.windowMs) || 3 * 60 * 1000);
+    if (ms <= 0) return;
+    const until = Date.now() + ms;
+    if (!st.burstUntil || until > Number(st.burstUntil)) st.burstUntil = until;
+  }
+
+  function bumpTransitionV2(key, st) {
+    if (!st) return;
+    const b = socialV2For(key)?.burst ?? {};
+    if (b.enabled === false) return;
+    const ms = Math.max(0, Number(b.transitionMs) || 30 * 60 * 1000);
+    if (ms <= 0) return;
+    const until = Date.now() + ms;
+    if (!st.transitionUntil || until > Number(st.transitionUntil)) st.transitionUntil = until;
+  }
+
+  function rollProbabilityV2(raw, fallback) {
+    const n = Number(raw);
+    const p = Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : fallback;
+    return p > 0 && Math.random() < p;
+  }
+
+  /** 发任意 OneBot 消息段（用于 @ 管理员这类需要 at 段的场景）。 */
+  async function onebotSendSegments(key, segments) {
+    const [kind, rawId] = String(key).split(':');
+    const id = Number(rawId);
+    if (!Number.isFinite(id) || id <= 0) throw new Error(`消息段发送：key 无效 ${key}`);
+    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+    const params = kind === 'private' ? { user_id: id, message: segments } : { group_id: id, message: segments };
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    const res = await fetch(`${httpUrl}/${action}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+      },
+      body: JSON.stringify(params),
+      signal: AbortSignal.timeout(15000)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+      throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}`);
+    }
+    return body.data;
+  }
+
+  /**
+   * 管理员关注词：群里有人问到指定内容时，直接 @ 管理员，不需要模型参与。
+   *
+   * 为什么放在桥接而不是提示词里：这是纯字符串匹配，交给模型判断既要多一步推理、
+   * 又可能漏（模型可能觉得"这不是在问我"）。放在这里则确定性 100%、零 token。
+   * 命中后同时开启活跃期/过渡期，让随后的讨论自然接上。
+   */
+  const ownerPingCooldown = new Map();
+  async function maybeOwnerPingV2(key, st, plainContent, kind) {
+    if (kind !== 'group') return false;
+    const p = socialV2For(key)?.ownerPing ?? {};
+    if (p.enabled === false) return false;
+    const kws = Array.isArray(p.keywords) ? p.keywords.map((k) => String(k ?? '').trim()).filter(Boolean) : [];
+    if (!kws.length) return false;
+    const text = String(plainContent ?? '');
+    const hit = kws.find((k) => text.includes(k));
+    if (!hit) return false;
+    const owner = String(cfg.ownerQQ ?? '').trim();
+    if (!owner) return false;
+    const cooldown = Math.max(0, Number(p.cooldownMs) || 10 * 60 * 1000);
+    const last = ownerPingCooldown.get(key) || 0;
+    if (Date.now() - last < cooldown) return false;
+    ownerPingCooldown.set(key, Date.now());
+    armActiveV2(key, st);
+    bumpTransitionV2(key, st);
+    const tmpl = String(p.text || '老大，有人问到「{kw}」的问题，你来看看');
+    const content = tmpl.replace(/\{kw\}/g, hit);
+    await onebotSendSegments(key, [
+      { type: 'at', data: { qq: owner } },
+      { type: 'text', data: { text: ' ' + content } }
+    ]);
+    log(`[reserved2] 关注词「${hit}」命中：已 @ 管理员 ${owner}，并开启活跃期`);
+    appendActivity(`${key} [关注词] 命中「${hit}」，已 @ 管理员`);
+    return true;
+  }
+
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     if (kind === 'private') return 'private';
     const tr = st.wakeConfig?.triggers ?? {};
     if (tr.anyMessage) return 'anyMessage';
+    // 点名类触发：100% 必醒，并且开启活跃期 + 过渡期（两者都从这一刻起算）。
+    const enterActive = () => { armActiveV2(key, st); bumpTransitionV2(key, st); };
     if (tr.atMention) {
       const atSelf = Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''));
-      if (atSelf || quoteTargetIsSelf) return 'atMention';
+      if (atSelf || quoteTargetIsSelf) { enterActive(); return 'atMention'; }
     }
     if (tr.nameMention && selfNickname) {
       // 用 plainContent（当前消息自己的文字）：textContent 含 `[引用 某人：原文]`，
       // 引用一条恰好提到机器人昵称的旧消息不该算「叫了名字」（那是被动触发的付费回合）。
       const lower = String(plainContent ?? '').toLowerCase();
-      if (lower.includes('@' + selfNickname.toLowerCase()) || lower.includes(selfNickname.toLowerCase())) return 'nameMention';
+      if (lower.includes('@' + selfNickname.toLowerCase()) || lower.includes(selfNickname.toLowerCase())) { enterActive(); return 'nameMention'; }
     }
     if (Array.isArray(tr.keywords) && tr.keywords.length) {
       const lower = String(plainContent ?? '').toLowerCase();
@@ -9864,13 +10011,14 @@ async function main() {
         if (!kwStr) continue;
         // 短英文/数字关键词（如 DS/R1）用词边界匹配，避免 ADS/BDSM/DSL 误触发。
         if (/^[a-z0-9]+$/.test(kwStr) && kwStr.length <= 4) {
-          if (new RegExp(`\\b${kwStr}\\b`, 'i').test(lower)) return `keyword:${kw}`;
+          if (new RegExp(`\\b${kwStr}\\b`, 'i').test(lower)) { enterActive(); return `keyword:${kw}`; }
         } else if (lower.includes(kwStr)) {
+          enterActive();
           return `keyword:${kw}`;
         }
       }
     }
-    if (tr.question && isDirectedAtAi(plainContent)) return 'question';
+    if (tr.question && isDirectedAtAi(plainContent)) { enterActive(); return 'question'; }
     if (Array.isArray(tr.speakerIds) && tr.speakerIds.length) {
       const speakerId = String(event?.user_id ?? event?.sender?.user_id ?? '');
       if (speakerId && tr.speakerIds.some((id) => String(id) === speakerId)) {
@@ -9878,6 +10026,21 @@ async function main() {
         return `speaker:${senderLabel}`;
       }
     }
+    // ── 三态：活跃期（滑动）→ 过渡期（滑动）→ 静默 ──
+    // 普通消息只有在活跃/过渡窗口内才可能唤醒，其余时间一律不醒（静默）。
+    const now = Date.now();
+    if (st.burstUntil && now < Number(st.burstUntil)) {
+      armActiveV2(key, st);   // 滑动续期：有人说话就把活跃期往后推
+      bumpTransitionV2(key, st);
+      if (rollProbabilityV2(socialV2For(key)?.burst?.probability, 0.5)) return 'burst';
+      return null;
+    }
+    if (st.transitionUntil && now < Number(st.transitionUntil)) {
+      bumpTransitionV2(key, st);   // 过渡期同样滑动续期
+      if (rollProbabilityV2(socialV2For(key)?.burst?.transitionProbability, 0.1)) return 'transition';
+      return null;
+    }
+    // 静默期：普通消息不唤醒。`triggers.probability` 仍保留（默认 0），需要时再开。
     if (Number(tr.probability) > 0 && Math.random() < Number(tr.probability)) return 'probability';
     return null;
   }
@@ -10105,8 +10268,9 @@ async function main() {
     //   · @/提问被丢弃则要等下一条消息才可能再唤醒。
     // 重试仍然遵守限频（等到窗口腾出位置），只是把「这一枪」补回来。
     const now = Date.now();
-    const maxPerMinute = Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0;
-    const maxPerHour = Number(cfg.socialV2?.wake?.maxWakePerHour) || 0;
+    const wakeCfgForKey = socialV2For(key)?.wake ?? {};
+    const maxPerMinute = Number(wakeCfgForKey.maxWakePerMinute) || 0;
+    const maxPerHour = Number(wakeCfgForKey.maxWakePerHour) || 0;
     const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
     const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
     if ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour)) {
@@ -10681,6 +10845,9 @@ async function main() {
         return;
       }
       const st = getSocialV2State(key);
+      // 关注词（如「压制境界」「道果之内」）：命中就直接 @ 管理员并开活跃期，不经模型。
+      void maybeOwnerPingV2(key, st, plainContent, kind)
+        .catch((error) => log(`[reserved2] 关注词处理异常 ${key}: ${error?.message ?? error}`));
       if (!st.bootstrapSent) {
         st.bootstrapSent = true;
         saveSocialV2State();

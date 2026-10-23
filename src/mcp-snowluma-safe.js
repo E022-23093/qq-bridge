@@ -763,26 +763,37 @@ if (cfg.socialV2?.tools?.sendPoke !== false) {
   );
 }
 
+// 等待类工具默认**不注册**：服务端有 10 秒静默下限，模型一旦用它"守着等回复"，
+// 整轮会被占住几十秒，期间所有新消息只能排队（表现为"半天不回、回来一串"）。
+// 打开方式：config.json 里 socialV2.tools.waitMessages = true，然后重启 DSH。
+if (cfg.socialV2?.tools?.waitMessages === true) {
 server.tool(
   'qq_wait_for_messages',
-  '等待分两种用途。首答前已读消息、只想确认有没有补充：用 purpose="reply"，按最后来信时间补足 quietMs 静默，已安静足够就立即返回；读取/思考时新到的消息也会返回，新消息重算静默。timeoutMs 是最长预算，不要求等满；预算到但 quiet=false 不代表对方已说完。此用途绝不代替沉睡前观察。等对方继续说、等回复或睡前观察：用默认 purpose="messages"；先等新消息，收到后才按 quietMs 等静默，没有新消息会等到 timeoutMs，单传 quietMs 不会缩短总等待。静默下限由后台配置，默认 10000ms。直接看 newMessages、unreadCount 和 readThroughSeq，返回消息无需重复查询；仍有未展示未读才补读。决定潜水/收尾时才用默认用途加 timeoutMs=300000 完成沉睡前观察，不能把 5 分钟观察放在首答之前；短等待不能代替。全程无人说话返回 preSleepWaitSatisfied=true；观察期间来了新消息返回 preSleepWaitObserved=true，读后不需参与可收尾，参与回复则下次收尾重新观察。preSleepWaitRemainingMs 仅供准备收尾时参考。',
+  '短暂检查有没有新消息（最多等 8 秒）。**不要用它守着等回复**：桥接会在有新消息/被 @/被叫到时自己唤醒你，守在会话里只会让下一句反应变慢。用途：purpose="reply" 在首答前确认对方还有没有补充；purpose="messages" 快速看一眼有没有新消息。直接看返回的 newMessages、unreadCount 和 readThroughSeq，返回消息无需重复查询。等待上限 8000ms，超出的预算会被强制截断。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    purpose: z.enum(['messages', 'reply']).optional().describe('默认 messages：等新消息/回复/睡前观察；reply：回复前短静默，计入最后来信后已过去的时间，绝不授予睡前观察资格'),
-    timeoutMs: z.number().optional().describe('等待预算毫秒数，默认 30000、最大 600000；reply 达到静默即返回，不必等满；沉睡前观察用 messages 并传 300000'),
-    minNewMessages: z.number().optional().describe('仅 messages 用途：至少等到多少条新消息才进入静默窗口，默认 1；reply 用途会忽略它'),
-    quietMs: z.number().optional().describe('静默窗口毫秒数，建议 10000~12000；reply 从最后来信开始计时，messages 只在等到新消息后计时；后台默认至少 10000')
+    purpose: z.enum(['messages', 'reply']).optional().describe('默认 messages：快速看新消息；reply：回复前短静默'),
+    timeoutMs: z.number().optional().describe('等待预算毫秒数，默认 3000，**最大 8000**（传更大也按 8000 截断）'),
+    minNewMessages: z.number().optional().describe('仅 messages 用途：至少等到多少条新消息才进入静默窗口，默认 1'),
+    quietMs: z.number().optional().describe('静默窗口毫秒数，默认 1200，**最大 3000**（传更大也按 3000 截断）')
   },
   async ({ key, token, purpose, timeoutMs, minNewMessages, quietMs }) => {
     try {
+      // 硬上限：这条工具曾经被模型用来"守着等回复"（timeoutMs=60000），
+      // 期间整个会话被占住，后续消息只能排队，表现为"半天不回、一回来一串"。
+      // 这里直接截断预算——想等更久就交给桥接的唤醒机制，而不是占着会话。
+      const WAIT_CAP_MS = 8000;
+      const QUIET_CAP_MS = 3000;
+      const cappedTimeout = Math.min(WAIT_CAP_MS, Math.max(500, Number(timeoutMs) || 3000));
+      const cappedQuiet = Math.min(QUIET_CAP_MS, Math.max(0, Number(quietMs) || 1200));
       // 必须走长轮询通道：全局 fetch（undici）有 300s headersTimeout，
       // 而沉睡前观察的预算就是 300s（见 agentApiLongPoll 的说明）。
       const data = await agentApiLongPoll('/api/socialV2/wait', {
         method: 'POST',
-        body: JSON.stringify({ key, purpose, timeoutMs, minNewMessages, quietMs }),
+        body: JSON.stringify({ key, purpose, timeoutMs: cappedTimeout, minNewMessages, quietMs: cappedQuiet }),
         headers: { 'x-agent-token': token },
-        timeoutMs: Math.min(725000, (Number(timeoutMs) || 30000) + Math.max(Number(quietMs) || 0, 10000) + 20000)
+        timeoutMs: cappedTimeout + cappedQuiet + 20000
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
@@ -790,6 +801,7 @@ server.tool(
     }
   }
 );
+}
 
 server.tool(
   'qq_report_feedback',

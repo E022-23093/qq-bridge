@@ -383,3 +383,29 @@ export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
   }
   throw new Error('重定向次数过多，已停止');
 }
+
+/**
+ * 抓取原始字节（带同样的 SSRF 防护，但**不校验**是不是图片）。
+ *
+ * 给「返回二进制但不是图片」的接口用，例如 B站 弹幕 `x/v1/dm/list.so`
+ * （content-encoding: deflate，需要调用方自行解压）。
+ */
+export async function safeFetchBytes(urlString, maxBytes = 4 * 1024 * 1024) {
+  validateLimit(maxBytes, 'maxBytes');
+  const MAX_REDIRECTS = 5;
+  let { url, addresses } = await validateFetchUrl(urlString);
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    const result = await requestOnce(url, addresses, maxBytes, true);
+    if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
+      if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
+      const next = new URL(result.redirect, url).toString();
+      ({ url, addresses } = await validateFetchUrl(next));
+      continue;
+    }
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      throw new Error(`抓取失败：HTTP ${result.statusCode}`);
+    }
+    return { url: url.toString(), statusCode: result.statusCode, buffer: result.buffer };
+  }
+  throw new Error('重定向次数过多，已停止');
+}
