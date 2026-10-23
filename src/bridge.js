@@ -4412,6 +4412,73 @@ async function main() {
           });
           return;
         }
+        // ── 调度器配置（控制台「调度」页）─────────────────────────────────
+        // 调度器是独立进程，启动时读 config.json 的 `scheduler` 段；这里只负责读写。
+        if (req.method === 'GET' && url.pathname === '/api/scheduler/config') {
+          sendJson({ ok: true, config: cfg.scheduler ?? {} });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/scheduler/config') {
+          const body = await readBody();
+          const input = (body.config && typeof body.config === 'object' && !Array.isArray(body.config)) ? body.config : {};
+          const bool = (v, dflt) => (typeof v === 'boolean' ? v : dflt);
+          const num = (v, dflt, min, max) => {
+            const n = Number(v);
+            if (!Number.isFinite(n)) return dflt;
+            return Math.min(max, Math.max(min, Math.round(n)));
+          };
+          const str = (v, dflt) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 40) : dflt);
+          const cur = cfg.scheduler ?? {};
+          const curRoles = cur.roles ?? {};
+          const curVideo = cur.videoShare ?? {};
+          const curChat = cur.proactiveChat ?? {};
+          const inRoles = input.roles ?? {};
+          const inVideo = input.videoShare ?? {};
+          const inChat = input.proactiveChat ?? {};
+
+          const peakRole = str(inRoles.peak, str(curRoles.peak, '傲娇助手'));
+          const offRole = str(inRoles.off, str(curRoles.off, '小鲸鱼'));
+          // 角色文件必须真实存在，否则调度器会一直切失败。
+          for (const name of [peakRole, offRole]) {
+            if (!fs.existsSync(path.join(ROOT, 'roles', `${name}.md`))) {
+              sendJson({ ok: false, error: `角色「${name}」不存在（roles/${name}.md）` }, 400);
+              return;
+            }
+          }
+
+          const next = {
+            roles: {
+              enabled: bool(inRoles.enabled, curRoles.enabled !== false),
+              peak: peakRole,
+              off: offRole
+            },
+            videoShare: {
+              enabled: bool(inVideo.enabled, curVideo.enabled !== false),
+              timesPerDay: num(inVideo.timesPerDay, curVideo.timesPerDay ?? 2, 0, 6),
+              startMin: num(inVideo.startMin, curVideo.startMin ?? 9 * 60, 0, 23 * 60),
+              endMin: num(inVideo.endMin, curVideo.endMin ?? 23 * 60 + 30, 0, 24 * 60),
+              minGapMin: num(inVideo.minGapMin, curVideo.minGapMin ?? 120, 0, 720)
+            },
+            proactiveChat: {
+              enabled: bool(inChat.enabled, curChat.enabled !== false),
+              timesPerDay: num(inChat.timesPerDay, curChat.timesPerDay ?? 2, 0, 6),
+              probability: Math.min(1, Math.max(0, Number(inChat.probability ?? curChat.probability ?? 0.5))),
+              minGapMin: num(inChat.minGapMin, curChat.minGapMin ?? 120, 0, 720)
+            }
+          };
+          if (next.videoShare.endMin <= next.videoShare.startMin) {
+            sendJson({ ok: false, error: '结束时间必须晚于开始时间' }, 400);
+            return;
+          }
+          const configFile = path.join(ROOT, 'config.json');
+          const file = readConfigObject(configFile);
+          file.scheduler = next;
+          atomicWriteJson(configFile, file);
+          cfg.scheduler = next;
+          log(`控制台：调度配置已更新（峰→${peakRole}，谷→${offRole}；搬屎 ${next.videoShare.timesPerDay} 次/天；主动开口 ${next.proactiveChat.timesPerDay} 次/天 @ ${Math.round(next.proactiveChat.probability * 100)}%）`);
+          sendJson({ ok: true, config: next });
+          return;
+        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/conversation-config') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();

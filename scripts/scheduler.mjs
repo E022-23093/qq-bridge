@@ -21,21 +21,45 @@ import { isPeakAt } from '../src/model-prices.js';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_PATH = path.join(ROOT, 'config.json');
 
-// 峰 / 谷 使用的人格卡（文件名 = 角色名，见 roles/）。
-const PEAK_ROLE = '傲娇助手';
-const OFF_ROLE = '小鲸鱼';
-// 槽位范围（本地时间，分钟）：09:00~23:30，两个点至少隔 2 小时。
-const SLOT_START_MIN = 9 * 60;
-const SLOT_END_MIN = 23 * 60 + 30;
-const SLOT_MIN_GAP_MIN = 120;
+// 峰 / 谷 使用的人格卡、搬屎与主动开口的时间安排，全部走 config.json 的 `scheduler` 段，
+// 这样控制台「调度」页可以直接改，不用改代码。下面是没配置时的默认值。
+const DEFAULTS = {
+  roles: { enabled: true, peak: '傲娇助手', off: '小鲸鱼' },
+  videoShare: { enabled: true, timesPerDay: 2, startMin: 9 * 60, endMin: 23 * 60 + 30, minGapMin: 120 },
+  proactiveChat: { enabled: true, timesPerDay: 2, probability: 0.5, minGapMin: 120 }
+};
 // 允许迟到的宽限：启动晚了超过这个窗口就跳过，避免一启动连补两条。
 const SLOT_GRACE_MIN = 10;
-// 私聊"主动开口"：每天两个随机时间点，每个点 50% 概率真的开口（没掷中就完全不起回合）。
-const CHAT_PROBABILITY = 0.5;
 // 和搬屎时间点至少隔开 30 分钟，避免同一时刻两条唤醒。
 const CHAT_GAP_FROM_VIDEO_MIN = 30;
 // 最近 60 分钟内有互动就不主动插话，免得打断正在进行的对话。
 const CHAT_SKIP_IF_ACTIVE_MS = 60 * 60 * 1000;
+
+/** 读调度配置（缺省值兜底 + 数值钳制）。 */
+function schedCfg() {
+  const c = readConfig().scheduler ?? {};
+  const roles = { ...DEFAULTS.roles, ...(c.roles ?? {}) };
+  const video = { ...DEFAULTS.videoShare, ...(c.videoShare ?? {}) };
+  const chat = { ...DEFAULTS.proactiveChat, ...(c.proactiveChat ?? {}) };
+  const clampInt = (v, min, max, dflt) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt;
+  };
+  return {
+    rolesEnabled: roles.enabled !== false,
+    peakRole: String(roles.peak || DEFAULTS.roles.peak),
+    offRole: String(roles.off || DEFAULTS.roles.off),
+    videoEnabled: video.enabled !== false,
+    videoCount: clampInt(video.timesPerDay, 0, 6, DEFAULTS.videoShare.timesPerDay),
+    chatEnabled: chat.enabled !== false,
+    chatCount: clampInt(chat.timesPerDay, 0, 6, DEFAULTS.proactiveChat.timesPerDay),
+    chatProbability: Math.min(1, Math.max(0, Number(chat.probability ?? DEFAULTS.proactiveChat.probability))),
+    startMin: clampInt(video.startMin, 0, 23 * 60, DEFAULTS.videoShare.startMin),
+    endMin: clampInt(video.endMin, 0, 24 * 60, DEFAULTS.videoShare.endMin),
+    minGapMin: clampInt(video.minGapMin, 0, 720, DEFAULTS.videoShare.minGapMin),
+    chatMinGapMin: clampInt(chat.minGapMin, 0, 720, DEFAULTS.proactiveChat.minGapMin)
+  };
+}
 
 function log(msg) {
   const line = `${new Date().toISOString().slice(11, 19)} [scheduler] ${msg}`;
@@ -159,9 +183,11 @@ async function waitForConsole(maxMs = 300_000) {
 }
 
 async function syncRole(force = false) {
+  const sc = schedCfg();
+  if (!sc.rolesEnabled) { lastTier = null; return; }
   const peak = isPeakAt(Date.now());
   if (!force && peak === lastTier) return;
-  const role = peak ? PEAK_ROLE : OFF_ROLE;
+  const role = peak ? sc.peakRole : sc.offRole;
   try {
     await api('/api/role', { role });
     lastTier = peak;
@@ -207,43 +233,51 @@ function makeRng(seed) {
   };
 }
 
-/** 当天在 [SLOT_START_MIN, SLOT_END_MIN] 内、且属于"空闲时段"的所有分钟。 */
+/** 当天在 [起, 止] 内、且属于"空闲时段"的所有分钟。 */
 function offPeakMinutes(date) {
+  const sc = schedCfg();
   const out = [];
-  for (let m = SLOT_START_MIN; m <= SLOT_END_MIN; m++) {
+  for (let m = sc.startMin; m <= sc.endMin; m++) {
     const at = new Date(date.getFullYear(), date.getMonth(), date.getDate(), Math.floor(m / 60), m % 60, 0, 0);
     if (!isPeakAt(at.getTime())) out.push(m);
   }
   return out;
 }
 
-/** 从允许的分钟里抽两个，尽量隔开 minGap 分钟。 */
-function pickTwoTimes(rnd, allowed, minGap) {
-  if (!allowed.length) return [];
+/** 从允许的分钟里抽 count 个，彼此至少隔 minGap 分钟。 */
+function pickTimes(rnd, allowed, count, minGap) {
+  if (!allowed.length || count <= 0) return [];
   if (allowed.length === 1) return [allowed[0]];
-  for (let i = 0; i < 400; i++) {
-    const a = allowed[Math.floor(rnd() * allowed.length)];
-    const b = allowed[Math.floor(rnd() * allowed.length)];
-    if (Math.abs(a - b) >= minGap) return [Math.min(a, b), Math.max(a, b)];
+  const picked = [];
+  for (let i = 0; i < 800 && picked.length < count; i++) {
+    const m = allowed[Math.floor(rnd() * allowed.length)];
+    if (picked.every((p) => Math.abs(p - m) >= minGap)) picked.push(m);
   }
-  // 兜底：取最早与最晚
-  const first = allowed[0];
-  const last = allowed[allowed.length - 1];
-  return last - first >= minGap ? [first, last] : [first];
+  // 抽不满就退化为等距取样，保证数量
+  if (picked.length < count) {
+    for (let i = 0; i < allowed.length && picked.length < count; i++) {
+      const m = allowed[Math.floor((i * allowed.length) / count)];
+      if (!picked.includes(m)) picked.push(m);
+    }
+  }
+  return picked.sort((a, b) => a - b);
 }
 
-/** 当天搬屎的两个时间点：只在空闲时段里抽（确定性随机，重启不变）。 */
+/** 当天搬屎的时间点：只在空闲时段里抽（确定性随机，重启不变）。 */
 function videoSlotsFor(date) {
-  const allowed = offPeakMinutes(date);
-  return pickTwoTimes(makeRng(daySeed(localDayKey(date))), allowed, SLOT_MIN_GAP_MIN);
+  const sc = schedCfg();
+  if (!sc.videoEnabled || sc.videoCount <= 0) return [];
+  return pickTimes(makeRng(daySeed(localDayKey(date))), offPeakMinutes(date), sc.videoCount, sc.minGapMin);
 }
 
-/** 私聊"主动开口"的两个时间点：另一个种子，同样只在空闲时段，且避开搬屎时间点。 */
+/** 私聊"主动开口"的时间点：另一个种子，同样只在空闲时段，且避开搬屎时间点。 */
 function chatSlotsFor(date) {
+  const sc = schedCfg();
+  if (!sc.chatEnabled || sc.chatCount <= 0) return [];
   const allowed = offPeakMinutes(date);
   const video = videoSlotsFor(date);
   const farEnough = (x) => video.every((v) => Math.abs(x - v) >= CHAT_GAP_FROM_VIDEO_MIN);
-  const raw = pickTwoTimes(makeRng(daySeed(`${localDayKey(date)}#chat`)), allowed, SLOT_MIN_GAP_MIN);
+  const raw = pickTimes(makeRng(daySeed(`${localDayKey(date)}#chat`)), allowed, sc.chatCount, sc.chatMinGapMin);
   return raw
     .map((m) => {
       if (farEnough(m)) return m;
@@ -256,7 +290,7 @@ function chatSlotsFor(date) {
 
 /** 某个时间点这次要不要开口（按日期+时间确定性掷，重启不改结果）。 */
 function chatRoll(day, minute) {
-  return makeRng(daySeed(`${day}#chat#${minute}`))() < CHAT_PROBABILITY;
+  return makeRng(daySeed(`${day}#chat#${minute}`))() < schedCfg().chatProbability;
 }
 
 const fired = new Set(); // key: `${day}|${minute}`
@@ -350,8 +384,9 @@ async function tick() {
 }
 
 const bootAt = new Date();
-log(`启动：峰→${PEAK_ROLE}，谷→${OFF_ROLE}`);
-log(`今日（空闲时段内）搬屎：${videoSlotsFor(bootAt).map(fmtMin).join(' / ')}｜主动开口机会：${chatSlotsFor(bootAt).map(fmtMin).join(' / ')}（各 50%）`);
+const bootCfg = schedCfg();
+log(`启动：峰→${bootCfg.peakRole}，谷→${bootCfg.offRole}${bootCfg.rolesEnabled ? '' : '（峰谷切角色已关闭）'}`);
+log(`今日（空闲时段内）搬屎：${videoSlotsFor(bootAt).map(fmtMin).join(' / ') || '（已关闭）'}｜主动开口机会：${chatSlotsFor(bootAt).map(fmtMin).join(' / ') || '（已关闭）'}（每次 ${Math.round(bootCfg.chatProbability * 100)}%）`);
 log('时间说明：谷时按 DeepSeek 定价的北京时间判定；上面显示的是本机本地时间（东京 UTC+9，比北京早 1 小时）');
 
 // 单实例互斥：start.bat 每跑一次都会再起一个调度器窗口，不挡住会重复触发搬屎。

@@ -1770,6 +1770,7 @@ button:active:not(:disabled) {
       <div class="nav-label">聊天行为</div>
       <button data-view="social-v2" class="nav-item"><span class="nav-icon" aria-hidden="true">◈</span>二代仿真<span class="nav-note">V2</span></button>
       <button data-view="per-conv" class="nav-item"><span class="nav-icon" aria-hidden="true">⊞</span>按会话配置</button>
+      <button data-view="schedule" class="nav-item"><span class="nav-icon" aria-hidden="true">◷</span>定时调度</button>
       <button data-view="social-v1" class="nav-item"><span class="nav-icon" aria-hidden="true">◇</span>一代仿真<span class="nav-note">V1</span></button>
       <button data-view="slang" class="nav-item"><span class="nav-icon" aria-hidden="true">▤</span>黑话词库</button>
       <div class="nav-label">管理</div>
@@ -2372,6 +2373,41 @@ button:active:not(:disabled) {
     <span class="meta" id="pcStatus"></span>
   </div>
   <div class="meta" style="margin-top:8px">提示：留空的输入框不会覆盖任何值；想“跟随全局”就点“清空”，之后该会话完全按全局配置走。</div>
+</section>
+
+<section id="section-schedule" data-page="schedule" class="card span-all">
+  <h2>定时调度</h2>
+  <div class="meta">这些由独立的调度器进程执行（<code>scripts/scheduler.mjs</code>），保存后写入 config.json；<b>重启桥接（restart.bat）后调度器才会读到新配置</b>。所有时间都按本机本地时间，且只在 DeepSeek 的「空闲时段」里抽点。</div>
+
+  <details class="settings-group" open><summary>峰谷自动切人格（高峰用省钱的小人格卡，空闲用完整人设）</summary><div class="settings-content">
+    <div class="row"><label style="flex:1">启用</label><input type="checkbox" id="scRolesEnabled" style="width:auto">
+      <span class="meta" style="flex:2">按 DeepSeek 定价的北京时间判定峰谷（与「令牌与花费」同口径）</span></div>
+    <div class="row"><label style="flex:1">高峰时段使用</label><select id="scPeakRole" style="flex:1"></select></div>
+    <div class="row"><label style="flex:1">空闲时段使用</label><select id="scOffRole" style="flex:1"></select></div>
+    <div class="meta">角色的正文在「人格与角色」页维护；这里只选切换目标。</div>
+  </div></details>
+
+  <details class="settings-group"><summary>定时搬屎（每天自动给管理员发几条 B站 视频）</summary><div class="settings-content">
+    <div class="row"><label style="flex:1">启用</label><input type="checkbox" id="scVideoEnabled" style="width:auto"></div>
+    <div class="row"><label style="flex:1">每天次数</label><input type="number" id="scVideoCount" min="0" max="6" step="1" style="max-width:100px"></div>
+    <div class="row"><label style="flex:1">时间范围</label>
+      <input type="time" id="scVideoStart" style="max-width:130px"> 至 <input type="time" id="scVideoEnd" style="max-width:130px"></div>
+    <div class="row"><label style="flex:1">两次最小间隔（分钟）</label><input type="number" id="scVideoGap" min="0" step="10" style="max-width:120px"></div>
+    <div class="meta">只在空闲时段内抽点；到点会唤醒 AI 去 B站 找一条 5 天内的抽象整活，发给管理员私聊。</div>
+  </div></details>
+
+  <details class="settings-group"><summary>定时主动聊天（每天主动找管理员说话）</summary><div class="settings-content">
+    <div class="row"><label style="flex:1">启用</label><input type="checkbox" id="scChatEnabled" style="width:auto"></div>
+    <div class="row"><label style="flex:1">每天次数</label><input type="number" id="scChatCount" min="0" max="6" step="1" style="max-width:100px"></div>
+    <div class="row"><label style="flex:1">每次真的开口的概率（0~1）</label><input type="number" id="scChatProb" min="0" max="1" step="0.05" style="max-width:100px"></div>
+    <div class="row"><label style="flex:1">两次最小间隔（分钟）</label><input type="number" id="scChatGap" min="0" step="10" style="max-width:120px"></div>
+    <div class="meta">概率由调度器掷：没掷中就不唤醒 AI，完全不产生费用。最近 1 小时聊过天会自动跳过。</div>
+  </div></details>
+
+  <div class="row" style="margin-top:12px">
+    <button id="scSave" style="font-weight:bold;padding:6px 16px">保存调度配置</button>
+    <span class="meta" id="scStatus"></span>
+  </div>
 </section>
 
 <section id="section-slang" data-page="slang" class="card span-all">
@@ -4501,6 +4537,7 @@ const consolePages = {
   persona: ['人格与角色', '给你的伙伴，一点独特个性。', '选择已有角色，或用自己的语言写下新的性格与表达方式。'],
   'social-v2': ['二代仿真', '自主参与，恰到好处。', '管理 AI 的工具、唤醒与发言节奏。展开需要调整的分组，修改后保存参数。'],
   'per-conv': ['按会话配置', '每个群、每个好友，各有一套规矩。', '为单个群或单个私聊单独设置唤醒、三态窗口、上下文阈值、限流与关注词；留空即沿用全局默认。'],
+  schedule: ['定时调度', '该热闹时热闹，该省钱时省钱。', '配置峰谷自动切换人格、每天自动给管理员搬视频、以及每天主动找管理员聊天的时间和概率。'],
   'social-v1': ['一代仿真', '为自然对话，设定合适的节奏。', '调整参与概率、活跃周期和分条发送；所有配置项完整保留。'],
   slang: ['黑话词库', '读懂群聊里的，言外之意。', '从候选到确认，让 AI 逐渐熟悉大家的表达习惯。'],
   usage: ['令牌与花费', '每一次思考，都算得清楚。', '实时查看 AI 的 token 消耗与花费，可下钻到每个群、每个好友、每一轮对话。'],
@@ -4769,6 +4806,103 @@ document.querySelector('.skip-link').addEventListener('click', event => {
   document.getElementById('mainContent').focus();
   document.getElementById('mainContent').scrollIntoView({ block: 'start', behavior: 'instant' });
 });
+/* ── 定时调度页 ────────────────────────────────────────────────────────────
+ * 调度器是独立进程，配置存在 config.json 的 `scheduler` 段。
+ * 这里只负责读写；改完要重启桥接（restart.bat）调度器才会读到。
+ */
+(function initScheduleUI(){
+  const $ = (id) => document.getElementById(id);
+  if (!$('scSave')) return;
+
+  const toHM = (min) => `${String(Math.floor(Number(min || 0) / 60)).padStart(2, '0')}:${String(Number(min || 0) % 60).padStart(2, '0')}`;
+  const toMin = (v) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(v || '')); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+  const say = (t) => { $('scStatus').textContent = t; };
+
+  async function loadRoles() {
+    try {
+      const r = await api('/api/roles');
+      const list = (r.roles || []).map((x) => (typeof x === 'string' ? x : x?.name)).filter(Boolean);
+      for (const id of ['scPeakRole', 'scOffRole']) {
+        const sel = $(id);
+        const prev = sel.value;
+        sel.innerHTML = '';
+        for (const name of list) {
+          const o = document.createElement('option');
+          o.value = name;
+          o.textContent = name;
+          sel.appendChild(o);
+        }
+        if (prev) sel.value = prev;
+      }
+    } catch { /* 角色列表拉不到时保留空下拉，不影响其它字段 */ }
+  }
+
+  async function load() {
+    try {
+      say('读取中…');
+      await loadRoles();
+      const r = await api('/api/scheduler/config');
+      const c = r.config || {};
+      const roles = c.roles || {}, v = c.videoShare || {}, ch = c.proactiveChat || {};
+      $('scRolesEnabled').checked = roles.enabled !== false;
+      if (roles.peak) $('scPeakRole').value = roles.peak;
+      if (roles.off) $('scOffRole').value = roles.off;
+      $('scVideoEnabled').checked = v.enabled !== false;
+      $('scVideoCount').value = v.timesPerDay ?? 2;
+      $('scVideoStart').value = toHM(v.startMin ?? 540);
+      $('scVideoEnd').value = toHM(v.endMin ?? 1410);
+      $('scVideoGap').value = v.minGapMin ?? 120;
+      $('scChatEnabled').checked = ch.enabled !== false;
+      $('scChatCount').value = ch.timesPerDay ?? 2;
+      $('scChatProb').value = ch.probability ?? 0.5;
+      $('scChatGap').value = ch.minGapMin ?? 120;
+      say('已载入');
+    } catch (error) {
+      say('读取失败：' + (error?.message || error));
+    }
+  }
+
+  async function save() {
+    const start = toMin($('scVideoStart').value);
+    const end = toMin($('scVideoEnd').value);
+    if (start === null || end === null || end <= start) { say('时间范围不合法：结束要晚于开始'); return; }
+    const config = {
+      roles: {
+        enabled: $('scRolesEnabled').checked,
+        peak: $('scPeakRole').value,
+        off: $('scOffRole').value
+      },
+      videoShare: {
+        enabled: $('scVideoEnabled').checked,
+        timesPerDay: Number($('scVideoCount').value) || 0,
+        startMin: start,
+        endMin: end,
+        minGapMin: Number($('scVideoGap').value) || 0
+      },
+      proactiveChat: {
+        enabled: $('scChatEnabled').checked,
+        timesPerDay: Number($('scChatCount').value) || 0,
+        probability: Number($('scChatProb').value),
+        minGapMin: Number($('scChatGap').value) || 0
+      }
+    };
+    try {
+      say('保存中…');
+      await api('/api/scheduler/config', 'POST', { config });
+      showConsoleToast('调度配置已保存');
+      say('已保存 — 重启桥接后生效');
+      await load();
+    } catch (error) {
+      say('保存失败：' + (error?.message || error));
+      showConsoleToast('保存失败：' + (error?.message || error));
+    }
+  }
+
+  $('scSave').addEventListener('click', save);
+  document.querySelectorAll('[data-view="schedule"]').forEach((btn) => btn.addEventListener('click', () => { setTimeout(load, 30); }));
+  if (location.hash === '#schedule') setTimeout(load, 200);
+})();
+
 function updateOverview(status, modeLabel) {
   const connection = document.getElementById('statusText');
   connection.textContent = status.dshReady ? 'DSH 已连接' : 'DSH 未连接';

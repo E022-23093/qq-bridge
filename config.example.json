@@ -292,5 +292,25 @@
     "maxTokens": 4096,
     "maxResults": 8,
     "timeoutMs": 35000
+  },
+  "scheduler": {
+    "roles": {
+      "enabled": true,
+      "peak": "傲娇助手",
+      "off": "小鲸鱼"
+    },
+    "videoShare": {
+      "enabled": true,
+      "timesPerDay": 2,
+      "startMin": 540,
+      "endMin": 1410,
+      "minGapMin": 120
+    },
+    "proactiveChat": {
+      "enabled": true,
+      "timesPerDay": 2,
+      "probability": 0.5,
+      "minGapMin": 120
+    }
   }
 }
